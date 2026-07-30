@@ -1,0 +1,1 @@
+{"suite": "cc18", "task_id": 3, "task_name": "3", "task_type": "classification", "model": "rf", "repeat": 0, "fold": 0, "sample": 0, "n_train": 2876, "n_test": 320, "n_features": 36, "n_classes": 2, "status": "ok", "accuracy": 0.9875, "balanced_accuracy": 0.9872020664553246, "log_loss": 0.06638201395744883, "fit_predict_sec": 1.4897425398230553}

@@ -1,0 +1,11 @@
+{
+  "d_model": 16,
+  "max_episode_rows": 512,
+  "max_cols": 128,
+  "k_max": 16,
+  "num_cat_decode_types": 128,
+  "num_row_layers": 1,
+  "num_row_context_layers": 1,
+  "n_heads": 2,
+  "dropout": 0.1
+}

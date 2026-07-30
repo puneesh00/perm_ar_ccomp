@@ -1,0 +1,15 @@
+{
+  "suite": "cc18",
+  "task_ids": null,
+  "max_tasks": 3,
+  "repeat": 0,
+  "fold": 0,
+  "sample": 0,
+  "models": "rf,hgb,xgb",
+  "max_train_rows": 5000,
+  "max_test_rows": 5000,
+  "n_jobs": 8,
+  "seed": 0,
+  "out_dir": "results/openml_baselines",
+  "run_name": "cc18_smoke_20031"
+}

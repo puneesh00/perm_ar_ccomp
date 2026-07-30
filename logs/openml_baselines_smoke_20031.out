@@ -1,0 +1,16 @@
+==============================
+Job ID: 20031
+Node: skynet.borealisai.com
+Date: Thu Jul 30 18:06:36 UTC 2026
+Submit dir: /home/ubuntu/borealis/users/puned00/perm_ar_ccomp
+==============================
+Python: /home/ubuntu/borealis/users/puned00/perm_ar_ccomp/.venv/bin/python
+Python 3.11.15
+numpy: 2.2.6
+pandas: 2.3.3
+scikit-learn: 1.9.0
+xgboost: 3.2.0
+lightgbm: 4.7.0
+catboost: 1.2.10
+openml: 0.15.1
+Starting cc18 smoke test...

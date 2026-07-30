@@ -1,0 +1,10 @@
+job_id,job_name,submit_time,cpus_requested,cpu_mem_requested,gpus_requested,state,wait_time,notes
+19929,tabcomp_train,2026-07-23T20:23:51,4,32G,1,FAILED,20h09m,started normally then failed at runtime
+19960,interactive_gpu,2026-07-27T18:34:18,8,64G,1,CANCELLED (never started),18h37m (cancelled, never ran),sat in queue, cancelled before ever starting
+19973,bash,2026-07-27T20:30:26,1,1G,0,COMPLETED,0h00m,started normally
+19981,interactive_gpu,2026-07-28T19:08:18,8,64G,1,PENDING,0h16m+ (as of 2026-07-28 19:24 UTC),still waiting
+19984,interactive_gpu,2026-07-28T19:12:53,8,64G,1,PENDING,0h11m+ (as of 2026-07-28 19:24 UTC),still waiting - likely duplicate of 19981
+19985,interactive_gpu,2026-07-28T19:13:17,8,64G,1,PENDING,0h11m+ (as of 2026-07-28 19:24 UTC),still waiting - likely duplicate of 19981
+19987,waittest_gpu1,2026-07-28T19:21:54,4,32G,1,PENDING,0h02m+ (as of 2026-07-28 19:24 UTC),wait-time probe: 1 GPU
+19988,waittest_gpu2,2026-07-28T19:21:54,4,32G,2,PENDING,0h02m+ (as of 2026-07-28 19:24 UTC),wait-time probe: 2 GPU
+19989,waittest_gpu4,2026-07-28T19:21:54,4,32G,4,PENDING,0h02m+ (as of 2026-07-28 19:24 UTC),wait-time probe: 4 GPU

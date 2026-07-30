@@ -1,0 +1,8 @@
+.venv/
+.venv.old-py310-bak/
+__pycache__/
+*.pyc
+*.pt
+*.ckpt
+*.pth
+.DS_Store

@@ -1,0 +1,42 @@
+==============================
+Job ID: 20002
+Node: skynet.borealisai.com
+Date: Wed Jul 29 20:56:21 UTC 2026
+Submit dir: /home/ubuntu/borealis/users/puned00/perm_ar_ccomp
+==============================
+Python: /home/ubuntu/borealis/users/puned00/perm_ar_ccomp/.venv/bin/python
+Python 3.11.15
+numpy: 2.2.6
+torch: 2.5.1+cu124 cuda available: False
+Starting smoke test training...
+=== Building synthetic table ===
+n_rows=32, n_cols=6, target_col=5
+col_types: [1, 0, 0, 0, 1, 1]
+cat_cardinalities: [15, 1, 1, 1, 4, 2]
+=== Building sampler / factorizer / model ===
+device=cpu
+params=85,457
+run_dir=results/cpu_smoke/smoke_20002
+[step 000001] loss=4.3054 sampler=mixture factorization=parallel steps/s=0.37
+[step 000002] loss=0.6522 sampler=mixture factorization=parallel steps/s=0.37
+[step 000003] loss=2.0916 sampler=mixture factorization=parallel steps/s=0.44
+[step 000004] loss=0.5857 sampler=mixture factorization=parallel steps/s=0.43
+[step 000005] loss=2.2204 sampler=mixture factorization=parallel steps/s=0.35
+[eval step 000005] saved results/cpu_smoke/smoke_20002/checkpoint_step_5.pt
+  eval/column_block/cat_acc: 0.1562
+  eval/column_block/loss: 2.1802
+  eval/column_block/num_mse: 1.0523
+  eval/label_feature/cat_acc: 0.3750
+  eval/label_feature/loss: 2.5715
+  eval/label_feature/num_mse: 1.3804
+  eval/random_cell/cat_acc: 0.3095
+  eval/random_cell/loss: 3.3638
+  eval/random_cell/num_mse: 1.3575
+  eval/row_block/cat_acc: 0.2708
+  eval/row_block/loss: 3.6441
+  eval/row_block/num_mse: 1.5361
+  eval/target/cat_acc: 0.3750
+  eval/target/loss: 1.0009
+  eval/target/num_mse: 0.0000
+Done. Results in: results/cpu_smoke/smoke_20002
+Done: Wed Jul 29 20:56:51 UTC 2026
