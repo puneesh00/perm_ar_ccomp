@@ -181,3 +181,54 @@ def make_synthetic_table(
         cat_decode_types=cat_decode_types,
         target_col=target_col,
     )
+
+
+@dataclass
+class SyntheticTableGeneratorConfig:
+    """
+    v2 synthetic generator config.
+
+    This is still a simple latent-factor generator, not the full TabPFN prior.
+    The important v2 change is that we sample a fresh table/task repeatedly.
+    """
+    n_rows: int = 256
+    n_cols: int = 16
+    p_categorical: float = 0.3
+    k_max: int = 16
+    n_classes: int = 2
+    target_col: Optional[int] = None
+    latent_dim: int = 8
+    noise: float = 0.1
+    base_seed: int = 0
+
+
+class SyntheticTableGenerator:
+    """
+    Samples fresh synthetic tables.
+
+    This gives the TabPFN-style training format:
+
+        for each gradient step:
+            sample synthetic dataset/task
+            sample O,M mask
+            train conditional completion
+    """
+
+    def __init__(self, cfg: SyntheticTableGeneratorConfig):
+        self.cfg = cfg
+        self.rng = np.random.default_rng(cfg.base_seed)
+
+    def sample_table(self) -> FullSyntheticTable:
+        seed = int(self.rng.integers(0, 2**31 - 1))
+
+        return make_synthetic_table(
+            n_rows=self.cfg.n_rows,
+            n_cols=self.cfg.n_cols,
+            p_categorical=self.cfg.p_categorical,
+            k_max=self.cfg.k_max,
+            n_classes=self.cfg.n_classes,
+            seed=seed,
+            target_col=self.cfg.target_col,
+            latent_dim=self.cfg.latent_dim,
+            noise=self.cfg.noise,
+        )

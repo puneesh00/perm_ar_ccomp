@@ -43,6 +43,8 @@ from tab_completion.factorization import (
 from tab_completion.synthetic_data import (
     FullSyntheticTable,
     make_synthetic_table,
+    SyntheticTableGeneratorConfig,
+    SyntheticTableGenerator,
 )
 from tab_completion.episode_utils import (
     task_to_torch_batch,
@@ -283,19 +285,33 @@ def build_eval_samplers(args) -> Dict[str, object]:
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
-    full: FullSyntheticTable,
     args,
     device: torch.device,
+    full_fixed: Optional[FullSyntheticTable] = None,
 ) -> Dict[str, float]:
     model.eval()
 
     # Reset eval RNG each time so eval tasks are fixed across checkpoints/runs,
     # assuming args.eval_seed is fixed.
     eval_rng = np.random.default_rng(args.eval_seed)
-
-    info = full.table_info()
     eval_samplers = build_eval_samplers(args)
     factorizer = build_factorizer(args)
+
+    eval_table_generator = None
+    if args.data_mode == "fresh_table":
+        eval_table_generator = SyntheticTableGenerator(
+            SyntheticTableGeneratorConfig(
+                n_rows=args.fresh_n_rows,
+                n_cols=args.n_cols,
+                p_categorical=args.p_categorical,
+                k_max=args.k_max,
+                n_classes=args.n_classes,
+                target_col=args.target_col,
+                latent_dim=args.latent_dim,
+                noise=args.data_noise,
+                base_seed=args.eval_seed,
+            )
+        )
 
     all_metrics: Dict[str, float] = {}
 
@@ -303,6 +319,15 @@ def evaluate(
         values_by_metric: Dict[str, list[float]] = {}
 
         for _ in range(args.eval_tasks):
+            if args.data_mode == "fixed_table":
+                assert full_fixed is not None
+                full = full_fixed
+            else:
+                assert eval_table_generator is not None
+                full = eval_table_generator.sample_table()
+
+            info = full.table_info()
+
             task = sampler.sample(info, eval_rng)
             plan = factorizer.build(task, eval_rng)
 
@@ -395,6 +420,22 @@ def parse_args():
     parser.add_argument("--data-seed", type=int, default=123)
     parser.add_argument("--latent-dim", type=int, default=8)
     parser.add_argument("--data-noise", type=float, default=0.1)
+    parser.add_argument(
+        "--data-mode",
+        type=str,
+        default="fixed_table",
+        choices=["fixed_table", "fresh_table"],
+        help=(
+            "fixed_table: generate one synthetic table and reuse it. "
+            "fresh_table: sample a fresh synthetic table per task."
+        ),
+    )
+    parser.add_argument(
+        "--fresh-n-rows",
+        type=int,
+        default=256,
+        help="Rows per freshly sampled table when --data-mode=fresh_table.",
+    )
 
     # Sampler
     parser.add_argument(
@@ -512,23 +553,50 @@ def main() -> None:
     logger = JSONLLogger(out_dir / "metrics.jsonl")
     wandb_run = maybe_init_wandb(args)
 
-    print("=== Building synthetic table ===")
-    full = make_synthetic_table(
-        n_rows=args.n_rows,
-        n_cols=args.n_cols,
-        p_categorical=args.p_categorical,
-        k_max=args.k_max,
-        n_classes=args.n_classes,
-        seed=args.data_seed,
-        target_col=args.target_col,
-        latent_dim=args.latent_dim,
-        noise=args.data_noise,
-    )
-    info = full.table_info()
+    print("=== Building synthetic data source ===")
 
-    print(f"n_rows={info.n_rows}, n_cols={info.n_cols}, target_col={info.target_col}")
-    print("col_types:", full.col_types.tolist())
-    print("cat_cardinalities:", full.cat_cardinalities.tolist())
+    if args.data_mode == "fixed_table":
+        full_fixed = make_synthetic_table(
+            n_rows=args.n_rows,
+            n_cols=args.n_cols,
+            p_categorical=args.p_categorical,
+            k_max=args.k_max,
+            n_classes=args.n_classes,
+            seed=args.data_seed,
+            target_col=args.target_col,
+            latent_dim=args.latent_dim,
+            noise=args.data_noise,
+        )
+        table_generator = None
+
+        info = full_fixed.table_info()
+        print("data_mode=fixed_table")
+        print(f"n_rows={info.n_rows}, n_cols={info.n_cols}, target_col={info.target_col}")
+        print("col_types:", full_fixed.col_types.tolist())
+        print("cat_cardinalities:", full_fixed.cat_cardinalities.tolist())
+
+    else:
+        full_fixed = None
+
+        table_generator = SyntheticTableGenerator(
+            SyntheticTableGeneratorConfig(
+                n_rows=args.fresh_n_rows,
+                n_cols=args.n_cols,
+                p_categorical=args.p_categorical,
+                k_max=args.k_max,
+                n_classes=args.n_classes,
+                target_col=args.target_col,
+                latent_dim=args.latent_dim,
+                noise=args.data_noise,
+                base_seed=args.data_seed,
+            )
+        )
+
+        print("data_mode=fresh_table")
+        print(
+            f"fresh table config: n_rows={args.fresh_n_rows}, "
+            f"n_cols={args.n_cols}, target_col={args.target_col}"
+        )
 
     print("=== Building sampler / factorizer / model ===")
     sampler = build_sampler(args)
@@ -578,6 +646,15 @@ def main() -> None:
         plan_modes: list[str] = []
 
         for _ in range(args.batch_tasks):
+            if args.data_mode == "fixed_table":
+                assert full_fixed is not None
+                full = full_fixed
+            else:
+                assert table_generator is not None
+                full = table_generator.sample_table()
+
+            info = full.table_info()
+
             task = sampler.sample(info, np_rng)
             plan = factorizer.build(task, np_rng)
 
@@ -654,9 +731,9 @@ def main() -> None:
         if step % args.eval_every == 0 or step == args.steps:
             eval_metrics = evaluate(
                 model=model,
-                full=full,
                 args=args,
                 device=device,
+                full_fixed=full_fixed,
             )
 
             row: Dict[str, object] = {
