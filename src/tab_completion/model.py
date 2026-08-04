@@ -267,16 +267,22 @@ class CellwiseCompletionModel(nn.Module):
     """
     v0 query-based table model.
 
-    Architecture:
-      CellTokenizer
-        -> RowEncoder over columns within each row
-        -> optional RowContextEncoder over rows
-        -> ColumnAggregator over observed cells
-        -> final cell representation
-        -> numerical/categorical typed heads
+    The model supports two conditioning modes per task:
 
-    This is not the final scalable architecture, but it is good for initial
-    objective experiments.
+    Transductive mode:
+        context_row_mask is None.
+        All rows can communicate through the row-context encoder and column
+        summaries use all observed cells.
+
+    Inductive-row mode:
+        context_row_mask is provided, shape [B, N], True for context rows.
+        Context rows attend only to context rows.
+        Query rows attend to context rows plus themselves.
+        Column summaries use context-row observed cells only.
+
+    Use inductive-row mode for TabPFN/TabICL-style target prediction and
+    label+feature tasks. Use transductive mode for random-cell/table
+    completion tasks.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -325,32 +331,111 @@ class CellwiseCompletionModel(nn.Module):
         self.num_head = nn.Linear(d, 1)
         self.cat_head = TypedCategoricalHead(cfg)
 
+    def _make_inductive_row_attn_mask(
+        self,
+        context_row_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Build row self-attention mask for one batch element.
+
+        context_row_mask:
+            [N], True for context rows, False for query rows.
+
+        Returns:
+            [N, N] boolean mask where True means attention is blocked.
+
+        Rule:
+            context target rows attend to context source rows only.
+            query target rows attend to context source rows plus themselves.
+        """
+        device = context_row_mask.device
+        N = context_row_mask.shape[0]
+
+        source_is_context = context_row_mask.view(1, N).expand(N, N)
+        target_is_query = (~context_row_mask).view(N, 1).expand(N, N)
+        same_row = torch.eye(N, dtype=torch.bool, device=device)
+
+        allowed = source_is_context | (target_is_query & same_row)
+        return ~allowed  # PyTorch bool mask: True means blocked.
+
+    def _run_row_context_encoder(
+        self,
+        row_state: torch.Tensor,
+        context_row_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        row_state:
+            [B, N, d]
+
+        context_row_mask:
+            None for transductive mode, or [B, N] True for context rows.
+        """
+        if self.row_context_encoder is None:
+            return row_state
+
+        if context_row_mask is None:
+            return self.row_context_encoder(row_state)
+
+        B, N, d = row_state.shape
+        outs = []
+        for b in range(B):
+            attn_mask = self._make_inductive_row_attn_mask(context_row_mask[b])
+            out_b = self.row_context_encoder(row_state[b : b + 1], mask=attn_mask)
+            outs.append(out_b)
+
+        return torch.cat(outs, dim=0)
+
     def forward(
         self,
         batch: TableTensorBatch,
         observed_mask: torch.Tensor,
         query_mask: torch.Tensor,
+        context_row_mask: Optional[torch.Tensor] = None,
     ) -> ModelOutput:
         """
         observed_mask, query_mask:
             Bool tensors [B, N, D].
+
+        context_row_mask:
+            None means transductive table-completion mode.
+
+            If provided, shape [B, N], True for context rows and False for query
+            rows. This enables inductive-row mode, where query rows cannot use
+            other query rows through row attention or column summaries.
         """
         H = self.tokenizer(batch, observed_mask, query_mask)
         B, N, D, d = H.shape
 
-        # Row-wise encoder over columns.
+        if context_row_mask is not None:
+            context_row_mask = context_row_mask.to(device=H.device, dtype=torch.bool)
+            if context_row_mask.shape != (B, N):
+                raise ValueError(
+                    f"context_row_mask shape {tuple(context_row_mask.shape)} "
+                    f"must be {(B, N)}."
+                )
+
+        # Row-wise encoder over columns. This is within-row only, so it cannot
+        # leak information between query rows.
         H_row = self.row_encoder(H.reshape(B * N, D, d)).reshape(B, N, D, d)
 
-        # Row context over rows. This is useful for ICL-style supervised prediction.
+        # Row-context encoder over row summaries. This is where we enforce
+        # inductive row semantics if context_row_mask is provided.
         row_state = H_row.mean(dim=2)  # [B, N, d]
-        if self.row_context_encoder is not None:
-            row_state = self.row_context_encoder(row_state)
+        row_state = self._run_row_context_encoder(row_state, context_row_mask)
 
-        # Column summaries over observed cells only.
-        obs_float = observed_mask.float().unsqueeze(-1)  # [B, N, D, 1]
-        denom = obs_float.sum(dim=1).clamp_min(1.0)      # [B, D, 1]
-        col_state = (H_row * obs_float).sum(dim=1) / denom
-        col_state = self.col_summary_mlp(col_state)     # [B, D, d]
+        # Column summaries.
+        # Transductive: use all observed cells.
+        # Inductive: use only context-row observed cells, preventing query row A
+        # from seeing query row B through a column summary.
+        if context_row_mask is None:
+            col_observed_mask = observed_mask
+        else:
+            col_observed_mask = observed_mask & context_row_mask[:, :, None]
+
+        obs_float = col_observed_mask.float().unsqueeze(-1)  # [B, N, D, 1]
+        denom = obs_float.sum(dim=1).clamp_min(1.0)          # [B, D, 1]
+        col_state = (H_row * obs_float).sum(dim=1) / denom   # [B, D, d]
+        col_state = self.col_summary_mlp(col_state)
 
         H_final = self.final_norm(
             H_row

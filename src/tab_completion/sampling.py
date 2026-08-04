@@ -411,6 +411,9 @@ class TargetPredictionSampler:
                 "target_col": target_col,
                 "n_context": self.n_context,
                 "n_query": self.n_query,
+                "conditioning_mode": "inductive_rows",
+                "context_rows_local": np.arange(self.n_context, dtype=np.int64),
+                "query_rows_local": np.arange(self.n_context, n_ep, dtype=np.int64),
                 "sparse": True,
             },
         )
@@ -466,6 +469,7 @@ class RandomCellSampler:
             meta={
                 "query_frac": self.query_frac,
                 "num_query_cells_requested": k,
+                "conditioning_mode": "transductive",
                 "sparse": True,
             },
         )
@@ -486,6 +490,7 @@ class ColumnBlockSampler:
     max_query_cols: int = 3
     exclude_target: bool = False
     replace_rows: bool = False
+    conditioning_mode: str = "inductive_rows"
     task_name: str = "column_block"
 
     def sample_sparse(self, info: TableInfo, rng: np.random.Generator) -> SparseCompletionTask:
@@ -528,6 +533,9 @@ class ColumnBlockSampler:
                 "query_cols_global": query_cols_global,
                 "n_context": self.n_context,
                 "n_query": self.n_query,
+                "conditioning_mode": self.conditioning_mode,
+                "context_rows_local": np.arange(self.n_context, dtype=np.int64),
+                "query_rows_local": np.arange(self.n_context, n_ep, dtype=np.int64),
                 "sparse": True,
             },
         )
@@ -546,6 +554,7 @@ class RowBlockSampler:
     n_query: int
     query_frac_cols: float = 1.0
     replace_rows: bool = False
+    conditioning_mode: str = "inductive_rows"
     task_name: str = "row_block"
 
     def sample_sparse(self, info: TableInfo, rng: np.random.Generator) -> SparseCompletionTask:
@@ -573,6 +582,9 @@ class RowBlockSampler:
             meta={
                 "query_frac_cols": self.query_frac_cols,
                 "query_cols_local": query_cols_local,
+                "conditioning_mode": self.conditioning_mode,
+                "context_rows_local": np.arange(self.n_context, dtype=np.int64),
+                "query_rows_local": np.arange(self.n_context, n_ep, dtype=np.int64),
                 "sparse": True,
             },
         )
@@ -591,6 +603,7 @@ class LabelFeatureSampler:
     n_feature_cols: int = 2
     target_col: Optional[int] = None
     replace_rows: bool = False
+    conditioning_mode: str = "inductive_rows"
     task_name: str = "label_plus_feature"
 
     def sample_sparse(self, info: TableInfo, rng: np.random.Generator) -> SparseCompletionTask:
@@ -639,6 +652,9 @@ class LabelFeatureSampler:
                 "target_col": target_col,
                 "sampled_feature_cols": sampled_features,
                 "query_cols_global": query_cols_global,
+                "conditioning_mode": self.conditioning_mode,
+                "context_rows_local": np.arange(self.n_context, dtype=np.int64),
+                "query_rows_local": np.arange(self.n_context, n_ep, dtype=np.int64),
                 "sparse": True,
             },
         )

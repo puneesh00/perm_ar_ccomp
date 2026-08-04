@@ -85,6 +85,7 @@ def build_sampler(args) -> object:
             min_query_cols=args.min_query_cols,
             max_query_cols=args.max_query_cols,
             exclude_target=args.exclude_target,
+            conditioning_mode=args.column_block_conditioning_mode,
         )
 
     if args.sampler == "row_block":
@@ -92,6 +93,7 @@ def build_sampler(args) -> object:
             n_context=args.n_context,
             n_query=args.n_query,
             query_frac_cols=args.query_frac_cols,
+            conditioning_mode=args.row_block_conditioning_mode,
         )
 
     if args.sampler == "label_feature":
@@ -100,6 +102,7 @@ def build_sampler(args) -> object:
             n_query=args.n_query,
             n_feature_cols=args.n_feature_cols,
             target_col=args.target_col,
+            conditioning_mode=args.label_feature_conditioning_mode,
         )
 
     if args.sampler == "mixture":
@@ -121,12 +124,14 @@ def build_sampler(args) -> object:
                     min_query_cols=args.min_query_cols,
                     max_query_cols=args.max_query_cols,
                     exclude_target=args.exclude_target,
+                    conditioning_mode=args.column_block_conditioning_mode,
                 ),
                 LabelFeatureSampler(
                     n_context=args.n_context,
                     n_query=args.n_query,
                     n_feature_cols=args.n_feature_cols,
                     target_col=args.target_col,
+                    conditioning_mode=args.label_feature_conditioning_mode,
                 ),
             ],
             weights=[
@@ -164,6 +169,39 @@ class StepLossOutput:
     metrics: Dict[str, float]
 
 
+def get_context_row_mask_from_task(task: CompletionTask) -> Optional[np.ndarray]:
+    """
+    Return context-row mask for inductive-row tasks, else None.
+
+    conditioning_mode is set by the sampler:
+      - transductive: all observed cells in the episode may be evidence.
+      - inductive_rows: query rows may use context rows plus themselves only.
+
+    This must come from task metadata, not from the current AR step, because
+    random-cell masking can query cells in many rows but should remain
+    transductive.
+    """
+    mode = task.meta.get("conditioning_mode", "transductive")
+
+    if mode == "transductive":
+        return None
+
+    if mode == "inductive_rows":
+        context_rows = task.meta.get("context_rows_local", None)
+        if context_rows is None:
+            raise ValueError(
+                "Task has conditioning_mode='inductive_rows' but no "
+                "context_rows_local in task.meta."
+            )
+
+        context_rows = np.asarray(context_rows, dtype=np.int64)
+        mask = np.zeros(task.observed_mask.shape[0], dtype=bool)
+        mask[context_rows] = True
+        return mask
+
+    raise ValueError(f"Unknown conditioning_mode={mode!r}")
+
+
 def compute_task_loss(
     model: nn.Module,
     full: FullSyntheticTable,
@@ -190,6 +228,16 @@ def compute_task_loss(
     observed_np = task.observed_mask.copy()
     task_shape = task.observed_mask.shape
 
+    context_row_mask_np = get_context_row_mask_from_task(task)
+    if context_row_mask_np is None:
+        context_row_mask_t = None
+    else:
+        context_row_mask_t = torch.as_tensor(
+            context_row_mask_np[None, :],
+            dtype=torch.bool,
+            device=device,
+        )
+
     step_losses: list[torch.Tensor] = []
     metrics_accum: Dict[str, float] = {}
     n_metric_steps = 0
@@ -203,7 +251,12 @@ def compute_task_loss(
         observed_t = mask_to_torch(observed_np, device)
         query_t = mask_to_torch(step_query_np, device)
 
-        out = model(batch, observed_t, query_t)
+        out = model(
+            batch,
+            observed_t,
+            query_t,
+            context_row_mask=context_row_mask_t,
+        )
 
         loss_out = typed_mse_ce_loss(
             out,
@@ -267,17 +320,20 @@ def build_eval_samplers(args) -> Dict[str, object]:
             min_query_cols=args.min_query_cols,
             max_query_cols=args.max_query_cols,
             exclude_target=args.exclude_target,
+            conditioning_mode=args.column_block_conditioning_mode,
         ),
         "row_block": RowBlockSampler(
             n_context=args.n_context,
             n_query=args.n_query,
             query_frac_cols=args.query_frac_cols,
+            conditioning_mode=args.row_block_conditioning_mode,
         ),
         "label_feature": LabelFeatureSampler(
             n_context=args.n_context,
             n_query=args.n_query,
             n_feature_cols=args.n_feature_cols,
             target_col=args.target_col,
+            conditioning_mode=args.label_feature_conditioning_mode,
         ),
     }
 
@@ -461,6 +517,29 @@ def parse_args():
     parser.add_argument("--max-query-cols", type=int, default=3)
     parser.add_argument("--n-feature-cols", type=int, default=2)
     parser.add_argument("--exclude-target", action="store_true")
+    parser.add_argument(
+        "--column-block-conditioning-mode",
+        type=str,
+        default="inductive_rows",
+        choices=["inductive_rows", "transductive"],
+        help=(
+            "conditioning semantics for column_block tasks. "
+            "inductive_rows means query rows cannot use other query rows; "
+            "transductive means all observed cells are evidence."
+        ),
+    )
+    parser.add_argument(
+        "--row-block-conditioning-mode",
+        type=str,
+        default="inductive_rows",
+        choices=["inductive_rows", "transductive"],
+    )
+    parser.add_argument(
+        "--label-feature-conditioning-mode",
+        type=str,
+        default="inductive_rows",
+        choices=["inductive_rows", "transductive"],
+    )
 
     # Mixture weights
     parser.add_argument("--mix-target", type=float, default=0.25)
