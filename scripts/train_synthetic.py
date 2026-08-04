@@ -297,45 +297,123 @@ def compute_task_loss(
 # ---------------------------------------------------------------------
 
 
+def _eval_override(args, name: str, fallback):
+    """Return eval-specific override if provided, otherwise training/default value."""
+    value = getattr(args, name)
+    return fallback if value is None else value
+
+
+def _parse_eval_sampler_names(eval_samplers: str) -> list[str]:
+    """Parse comma-separated eval sampler names."""
+    if eval_samplers == "all":
+        return ["target", "random_cell", "column_block", "row_block", "label_feature"]
+
+    names = [x.strip() for x in eval_samplers.split(",") if x.strip()]
+    allowed = {"target", "random_cell", "column_block", "row_block", "label_feature"}
+    unknown = [x for x in names if x not in allowed]
+    if unknown:
+        raise ValueError(
+            f"Unknown eval samplers: {unknown}. Allowed values are {sorted(allowed)} or 'all'."
+        )
+    if not names:
+        raise ValueError("--eval-samplers produced an empty list.")
+    return names
+
+
 def build_eval_samplers(args) -> Dict[str, object]:
     """
-    Every trained model is evaluated on all task families.
-    This creates the capability matrix:
-      trained objective x evaluated task.
+    Build evaluation samplers with eval-specific task-shape overrides.
+
+    Training args such as --n-query are global, but we often want different
+    evaluation shapes, e.g. target prediction with many query rows and row
+    completion with one partial query row. The --eval-* arguments override
+    the corresponding training arguments only for evaluation.
     """
-    return {
+    target_n_context = _eval_override(args, "eval_target_n_context", args.n_context)
+    target_n_query = _eval_override(args, "eval_target_n_query", args.n_query)
+
+    random_n_episode_rows = _eval_override(
+        args, "eval_random_n_episode_rows", args.n_episode_rows
+    )
+    random_query_frac = _eval_override(args, "eval_random_query_frac", args.query_frac)
+    random_max_query_cells = _eval_override(
+        args, "eval_random_max_query_cells", args.max_query_cells
+    )
+
+    column_n_context = _eval_override(args, "eval_column_n_context", args.n_context)
+    column_n_query = _eval_override(args, "eval_column_n_query", args.n_query)
+    column_min_query_cols = _eval_override(
+        args, "eval_column_min_query_cols", args.min_query_cols
+    )
+    column_max_query_cols = _eval_override(
+        args, "eval_column_max_query_cols", args.max_query_cols
+    )
+    column_exclude_target = _eval_override(
+        args, "eval_column_exclude_target", args.exclude_target
+    )
+    column_conditioning_mode = _eval_override(
+        args, "eval_column_conditioning_mode", args.column_block_conditioning_mode
+    )
+
+    row_n_context = _eval_override(args, "eval_row_n_context", args.n_context)
+    row_n_query = _eval_override(args, "eval_row_n_query", args.n_query)
+    row_query_frac_cols = _eval_override(
+        args, "eval_row_query_frac_cols", args.query_frac_cols
+    )
+    row_conditioning_mode = _eval_override(
+        args, "eval_row_conditioning_mode", args.row_block_conditioning_mode
+    )
+
+    label_feature_n_context = _eval_override(
+        args, "eval_label_feature_n_context", args.n_context
+    )
+    label_feature_n_query = _eval_override(
+        args, "eval_label_feature_n_query", args.n_query
+    )
+    label_feature_n_feature_cols = _eval_override(
+        args, "eval_label_feature_n_feature_cols", args.n_feature_cols
+    )
+    label_feature_conditioning_mode = _eval_override(
+        args, "eval_label_feature_conditioning_mode",
+        args.label_feature_conditioning_mode,
+    )
+
+    registry = {
         "target": TargetPredictionSampler(
-            n_context=args.n_context,
-            n_query=args.n_query,
+            n_context=target_n_context,
+            n_query=target_n_query,
             target_col=args.target_col,
         ),
         "random_cell": RandomCellSampler(
-            n_episode_rows=args.n_episode_rows,
-            query_frac=args.query_frac,
-            max_query_cells=args.max_query_cells,
+            n_episode_rows=random_n_episode_rows,
+            query_frac=random_query_frac,
+            max_query_cells=random_max_query_cells,
         ),
         "column_block": ColumnBlockSampler(
-            n_context=args.n_context,
-            n_query=args.n_query,
-            min_query_cols=args.min_query_cols,
-            max_query_cols=args.max_query_cols,
-            exclude_target=args.exclude_target,
-            conditioning_mode=args.column_block_conditioning_mode,
+            n_context=column_n_context,
+            n_query=column_n_query,
+            min_query_cols=column_min_query_cols,
+            max_query_cols=column_max_query_cols,
+            exclude_target=column_exclude_target,
+            conditioning_mode=column_conditioning_mode,
         ),
         "row_block": RowBlockSampler(
-            n_context=args.n_context,
-            n_query=args.n_query,
-            query_frac_cols=args.query_frac_cols,
-            conditioning_mode=args.row_block_conditioning_mode,
+            n_context=row_n_context,
+            n_query=row_n_query,
+            query_frac_cols=row_query_frac_cols,
+            conditioning_mode=row_conditioning_mode,
         ),
         "label_feature": LabelFeatureSampler(
-            n_context=args.n_context,
-            n_query=args.n_query,
-            n_feature_cols=args.n_feature_cols,
+            n_context=label_feature_n_context,
+            n_query=label_feature_n_query,
+            n_feature_cols=label_feature_n_feature_cols,
             target_col=args.target_col,
-            conditioning_mode=args.label_feature_conditioning_mode,
+            conditioning_mode=label_feature_conditioning_mode,
         ),
     }
+
+    names = _parse_eval_sampler_names(args.eval_samplers)
+    return {name: registry[name] for name in names}
 
 
 @torch.no_grad()
@@ -594,6 +672,68 @@ def parse_args():
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--eval-tasks", type=int, default=20)
     parser.add_argument("--eval-seed", type=int, default=999)
+    parser.add_argument(
+        "--eval-samplers",
+        type=str,
+        default="all",
+        help=(
+            "Comma-separated eval sampler names: "
+            "target,random_cell,column_block,row_block,label_feature. "
+            "Use 'all' to evaluate every task family."
+        ),
+    )
+
+    # Eval-specific target-prediction overrides.
+    parser.add_argument("--eval-target-n-context", type=int, default=None)
+    parser.add_argument("--eval-target-n-query", type=int, default=None)
+
+    # Eval-specific random-cell overrides.
+    parser.add_argument("--eval-random-n-episode-rows", type=int, default=None)
+    parser.add_argument("--eval-random-query-frac", type=float, default=None)
+    parser.add_argument("--eval-random-max-query-cells", type=int, default=None)
+
+    # Eval-specific column-completion overrides.
+    parser.add_argument("--eval-column-n-context", type=int, default=None)
+    parser.add_argument("--eval-column-n-query", type=int, default=None)
+    parser.add_argument("--eval-column-min-query-cols", type=int, default=None)
+    parser.add_argument("--eval-column-max-query-cols", type=int, default=None)
+    parser.add_argument(
+        "--eval-column-exclude-target",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override exclude_target only for column_block evaluation. "
+            "Use --eval-column-exclude-target or --no-eval-column-exclude-target."
+        ),
+    )
+    parser.add_argument(
+        "--eval-column-conditioning-mode",
+        type=str,
+        default=None,
+        choices=["inductive_rows", "transductive"],
+    )
+
+    # Eval-specific row-completion overrides.
+    parser.add_argument("--eval-row-n-context", type=int, default=None)
+    parser.add_argument("--eval-row-n-query", type=int, default=None)
+    parser.add_argument("--eval-row-query-frac-cols", type=float, default=None)
+    parser.add_argument(
+        "--eval-row-conditioning-mode",
+        type=str,
+        default=None,
+        choices=["inductive_rows", "transductive"],
+    )
+
+    # Eval-specific label+feature overrides.
+    parser.add_argument("--eval-label-feature-n-context", type=int, default=None)
+    parser.add_argument("--eval-label-feature-n-query", type=int, default=None)
+    parser.add_argument("--eval-label-feature-n-feature-cols", type=int, default=None)
+    parser.add_argument(
+        "--eval-label-feature-conditioning-mode",
+        type=str,
+        default=None,
+        choices=["inductive_rows", "transductive"],
+    )
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--out-dir", type=str, default="results/synthetic_v0")
     parser.add_argument("--run-name", type=str, default=None)
@@ -815,13 +955,18 @@ def main() -> None:
                 full_fixed=full_fixed,
             )
 
+            eval_loss = next(
+                (float(value) for key, value in eval_metrics.items() if key.endswith("/loss")),
+                0.0,
+            )
+
             row: Dict[str, object] = {
                 "step": step,
                 "split": "eval",
                 "sampler": args.sampler,
                 "factorization": args.factorization,
                 "ar_unit": args.ar_unit,
-                "loss": float(eval_metrics.get("eval/target/loss", 0.0)),
+                "loss": eval_loss,
                 "grad_norm": 0.0,
                 "steps_per_sec": 0.0,
                 "elapsed_sec": time.time() - start_time,
