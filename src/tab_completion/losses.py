@@ -13,6 +13,7 @@ from tab_completion.model import (
     CATEGORICAL,
     TableTensorBatch,
     ModelOutput,
+    expand_per_col,
 )
 
 
@@ -39,7 +40,8 @@ def typed_mse_ce_loss(
     device = batch.x_num.device
     col_types = batch.col_types.to(device=device, dtype=torch.long)
 
-    type_ids = col_types.view(1, 1, -1).expand_as(query_mask)
+    B, N, D = query_mask.shape
+    type_ids = expand_per_col(col_types, B, N, D)
 
     num_query = query_mask & (type_ids == NUMERICAL)
     cat_query = query_mask & (type_ids == CATEGORICAL)

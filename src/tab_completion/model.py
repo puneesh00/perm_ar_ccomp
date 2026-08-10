@@ -17,6 +17,29 @@ QUERY = 1
 IGNORED = 2
 
 
+def expand_per_col(t: torch.Tensor, B: int, N: int, D: int) -> torch.Tensor:
+    """
+    Broadcasts a per-column tensor to [B, N, D].
+
+    Accepts either:
+      [D]    -- one shared column-type/cardinality vector for the whole
+                batch (the historical convention: every episode in the
+                batch is a slice of the same underlying table).
+      [B, D] -- a per-batch-element vector (needed once a batch mixes
+                independently-sampled fresh tables, since which columns
+                are numerical/categorical is itself randomized per table
+                by the synthetic generators -- see synthetic_data_tabpfn.py's
+                p_categorical draw. cat_decode_types is exempt from this:
+                it's always np.arange(n_cols), deterministic across every
+                table, so it never needs the [B, D] form).
+    """
+    if t.dim() == 1:
+        return t.view(1, 1, D).expand(B, N, D)
+    if t.dim() == 2:
+        return t.view(B, 1, D).expand(B, N, D)
+    raise ValueError(f"expected a 1D [D] or 2D [B, D] tensor, got shape {tuple(t.shape)}")
+
+
 @dataclass
 class TableTensorBatch:
     """
@@ -81,6 +104,81 @@ class ModelConfig:
     num_row_context_layers: int = 1
     n_heads: int = 4
     dropout: float = 0.1
+    # SingleStreamTokenizer and PermARTokenizer only: re-standardize x_num
+    # per episode using observed(context)-only mean/std, mirroring
+    # TabPFNV1's FeatureEncoder. Ignored by the original CellTokenizer. When
+    # unified_cat_encoding is also on, this normalization extends to the
+    # cast-to-float categorical values too (TabPFNV1's FeatureEncoder never
+    # distinguishes types before normalizing -- see model_tabpfn_v1.py).
+    # DEFAULT ON as of 2026-08-09: the single biggest lever found in the SCM
+    # prior investigation (see the run log/report) -- settled architecture.
+    context_normalize: bool = True
+    # SingleStreamTokenizer and PermARTokenizer only: drop cat_value_emb
+    # entirely and encode categorical cells by casting their (post-shuffle,
+    # non-ordinal) raw id to float and routing it through the same
+    # num_value_mlp as numerics -- TabPFNV1Model's actual recipe
+    # (train_tabpfn_v1_baseline.py:57-61 casts x_cat straight to float32 and
+    # stacks it with x_num before the shared FeatureEncoder ever sees it).
+    # DEFAULT ON as of 2026-08-09: measured no difference vs. the separate
+    # per-column encoder across two full 40k-step runs (both architectures)
+    # -- kept simpler version now that it's confirmed harmless. Settled.
+    unified_cat_encoding: bool = True
+    # TypedCategoricalHead only: use one shared [k_max, d] decode matrix for
+    # every column instead of one private slice per cat_decode_types value.
+    # Cardinality masking (see TypedCategoricalHead.forward) is unaffected
+    # either way -- it operates purely on the K axis of the logits.
+    # DEFAULT ON as of 2026-08-09: same "measured no difference, keep the
+    # simpler version" reasoning as unified_cat_encoding. Settled. NOTE:
+    # this field is also read by the original one_stream architecture
+    # (CellwiseCompletionModel, via the same TypedCategoricalHead) -- that
+    # architecture was never part of the ablation runs that validated this
+    # default, so if you're running one_stream, sanity-check this choice
+    # rather than assuming it transfers.
+    shared_cat_decoder: bool = True
+    # SingleStreamModel and PermARCompletionModel only: group each axis pair
+    # as row-attn, col-attn, THEN one FFN application -- TabPFNV1Layer's
+    # actual layout (model_tabpfn_v1.py) -- instead of this codebase's
+    # default of row-attn+FFN, col-attn+FFN as two separate sub-layers. Same
+    # total attention ops for half the FFN params/compute, so depth can be
+    # increased within a fixed FFN budget. Requires num_row_layers ==
+    # num_row_context_layers (one paired row+col block per count).
+    # DEFAULT ON as of 2026-08-09: settled architecture -- see
+    # train_synthetic.py's --num-row-layers/--num-row-context-layers
+    # defaults, which were changed to 8/8 (equal) alongside this flag to
+    # keep the default runnable out of the box.
+    tabpfn_style_layers: bool = True
+    # PermARCompletionModel only: share attention (and FFN) weights between
+    # the content and query streams, XLNet-style, instead of separate
+    # content_attn/query_attn (content_ffn/query_ffn) parameter sets. Still
+    # runs attention/FFN twice per axis (once per stream) -- same
+    # activations, half the attention+FFN parameters -- so depth can be
+    # increased without the two-stream parameter tax growing with it.
+    # DEFAULT ON as of 2026-08-09: settled architecture. Harmless/inert for
+    # single_stream and the original one_stream architecture -- neither
+    # tokenizer ever reads this field (single_stream has no content/query
+    # split for it to apply to).
+    share_stream_attn: bool = True
+    # SingleStreamTokenizer and PermARTokenizer only: drop type_emb (num vs
+    # cat) and origin_emb (observed vs query-this-episode) entirely -- no
+    # additive signal beyond the value encoding itself. Matches TabPFNV1's
+    # actual design: it has no type-identity signal (see
+    # unified_cat_encoding's docstring) and no flag marking which rows'
+    # target slots hold a real label vs. the mean-imputed placeholder --
+    # TargetEncoder relies purely on the row-level context/query attention
+    # split (model_tabpfn_v1.py) for correctness, never a token-level flag.
+    # DEFAULT ON as of 2026-08-09: settled architecture -- see the run
+    # log/report for the early-training loss comparison that validated this.
+    drop_type_origin_emb: bool = True
+    # SingleStreamModel/PermARCompletionModel: post-LN instead of this
+    # codebase's default pre-LN -- attn/ffn operate on the previous stage's
+    # raw (already-normalized-once) output, residual add happens first, THEN
+    # LayerNorm -- matching TabPFNV1Layer's actual layout exactly.
+    # DEFAULT STAYS OFF (pre-LN) as of 2026-08-09: settled choice -- post-LN
+    # measurably speeds up early convergence (see the run log/report) but
+    # pre-LN was deliberately kept as the default given plans to scale depth
+    # further, where pre-LN's stability advantage matters more than at the
+    # 6-16 layers tested so far. Worth revisiting with --post-ln per run.
+    post_ln: bool = False
 
 
 class CellTokenizer(nn.Module):
@@ -217,10 +315,11 @@ class TypedCategoricalHead(nn.Module):
         self.cfg = cfg
 
         d = cfg.d_model
+        n_types = 1 if cfg.shared_cat_decoder else cfg.num_cat_decode_types
         self.unemb = nn.Parameter(
-            torch.randn(cfg.num_cat_decode_types, cfg.k_max, d) * (d ** -0.5)
+            torch.randn(n_types, cfg.k_max, d) * (d ** -0.5)
         )
-        self.bias = nn.Parameter(torch.zeros(cfg.num_cat_decode_types, cfg.k_max))
+        self.bias = nn.Parameter(torch.zeros(n_types, cfg.k_max))
 
     def forward(
         self,
@@ -247,8 +346,11 @@ class TypedCategoricalHead(nn.Module):
         cat_decode_types = cat_decode_types.to(device=device, dtype=torch.long)
         cat_cardinalities = cat_cardinalities.to(device=device, dtype=torch.long)
 
-        type_ids = cat_decode_types.view(1, 1, D).expand(B, N, D)
-        type_ids = type_ids.clamp(min=0, max=self.cfg.num_cat_decode_types - 1)
+        if self.cfg.shared_cat_decoder:
+            type_ids = torch.zeros(B, N, D, dtype=torch.long, device=device)
+        else:
+            type_ids = expand_per_col(cat_decode_types, B, N, D)
+            type_ids = type_ids.clamp(min=0, max=self.cfg.num_cat_decode_types - 1)
 
         # [B, N, D, K, d]
         W = self.unemb[type_ids]
@@ -257,7 +359,7 @@ class TypedCategoricalHead(nn.Module):
         logits = torch.einsum("bndh,bndkh->bndk", h, W) + b
 
         k_ids = torch.arange(self.cfg.k_max, device=device).view(1, 1, 1, self.cfg.k_max)
-        valid = k_ids < cat_cardinalities.view(1, 1, D, 1).clamp(min=1)
+        valid = k_ids < expand_per_col(cat_cardinalities, B, N, D).unsqueeze(-1).clamp(min=1)
 
         logits = logits.masked_fill(~valid, float("-inf"))
         return logits

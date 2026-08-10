@@ -145,7 +145,9 @@ def make_synthetic_table(
         x_cat[:, j] = quantile_bins(raw[:, j], k_j)
         cat_cardinalities[j] = k_j
 
-    # Target depends on several features and latent factors.
+    # Target depends only on visible features (no hidden latent term) plus
+    # small residual noise, and is a deterministic function of that signal
+    # (no extra label-flip sampling on top).
     target_signal = np.zeros(n_rows, dtype=np.float32)
 
     useful_cols = feature_cols[: min(6, len(feature_cols))]
@@ -157,12 +159,10 @@ def make_synthetic_table(
             denom = max(cat_cardinalities[j] - 1, 1)
             target_signal += coef * (x_cat[:, j].astype(np.float32) / denom)
 
-    target_signal += 0.5 * z[:, 0]
     target_signal += noise * rng.normal(size=n_rows).astype(np.float32)
 
     if n_classes == 2:
-        probs = 1.0 / (1.0 + np.exp(-target_signal))
-        y = rng.binomial(1, probs).astype(np.int64)
+        y = (target_signal > 0).astype(np.int64)
     else:
         y = quantile_bins(target_signal, n_classes)
 

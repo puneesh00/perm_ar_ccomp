@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -54,8 +55,23 @@ from tab_completion.episode_utils import (
 from tab_completion.model import (
     ModelConfig,
     CellwiseCompletionModel,
+    NUMERICAL,
 )
 from tab_completion.losses import typed_mse_ce_loss
+from tab_completion.model_perm_ar import (
+    PermARCompletionModel,
+    compute_task_loss_onepass,
+    compute_task_loss_onepass_batched,
+)
+from tab_completion.model_single_stream import (
+    SingleStreamModel,
+    compute_task_loss_single_stream,
+    compute_task_loss_single_stream_batched,
+)
+from tab_completion.synthetic_data_tabpfn import (
+    TabPFNSCMConfig,
+    TabPFNSCMTableGenerator,
+)
 
 
 # ---------------------------------------------------------------------
@@ -416,6 +432,148 @@ def build_eval_samplers(args) -> Dict[str, object]:
     return {name: registry[name] for name in names}
 
 
+def _context_query_features(
+    full: FullSyntheticTable,
+    task: CompletionTask,
+) -> Optional[tuple]:
+    """
+    Shared feature/label extraction for the `target`-sampler context
+    baselines below: builds one-hot(categorical) + raw(numerical) features
+    from this episode's context/query rows (same rows/columns the model
+    sees). Returns (X_ctx, y_ctx, X_qry, y_qry) or None if the task doesn't
+    carry the metadata these baselines need (e.g. a non-target sampler).
+    """
+    try:
+        from sklearn.preprocessing import OneHotEncoder
+    except ImportError:
+        return None
+
+    target_col = task.meta.get("target_col")
+    context_rows_local = task.meta.get("context_rows_local")
+    query_rows_local = task.meta.get("query_rows_local")
+    if target_col is None or context_rows_local is None or query_rows_local is None:
+        return None
+
+    global_rows = task.row_idx
+    feature_cols = [c for c in task.col_idx.tolist() if c != target_col]
+
+    parts = []
+    for j in feature_cols:
+        if full.col_types[j] == NUMERICAL:
+            parts.append(full.x_num[global_rows, j][:, None])
+        else:
+            card = int(full.cat_cardinalities[j])
+            enc = OneHotEncoder(sparse_output=False, categories=[list(range(card))])
+            parts.append(enc.fit_transform(full.x_cat[global_rows, j][:, None]))
+    X = np.concatenate(parts, axis=1) if parts else np.zeros((len(global_rows), 0))
+    y = full.x_cat[global_rows, target_col]
+
+    return (
+        X[context_rows_local], y[context_rows_local],
+        X[query_rows_local], y[query_rows_local],
+    )
+
+
+def logreg_context_baseline_acc(
+    full: FullSyntheticTable,
+    task: CompletionTask,
+) -> Optional[float]:
+    """
+    Fits a fresh sklearn LogisticRegression on this episode's context rows
+    and scores it on the query rows. Gives a finite-context oracle baseline
+    for the `target` sampler, so transformer accuracy can be judged against
+    "best a correctly-specified linear model can do with the same amount of
+    context" rather than an arbitrary number.
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+    except ImportError:
+        return None
+
+    features = _context_query_features(full, task)
+    if features is None:
+        return None
+    X_ctx, y_ctx, X_qry, y_qry = features
+
+    if len(np.unique(y_ctx)) < 2:
+        pred = np.full_like(y_qry, y_ctx[0])
+    else:
+        clf = LogisticRegression(max_iter=1000)
+        clf.fit(X_ctx, y_ctx)
+        pred = clf.predict(X_qry)
+
+    return float((pred == y_qry).mean())
+
+
+def rf_context_baseline_acc(
+    full: FullSyntheticTable,
+    task: CompletionTask,
+) -> Optional[float]:
+    """
+    Same finite-context-oracle idea as logreg_context_baseline_acc, but a
+    RandomForestClassifier: a nonlinear, non-in-context baseline that (unlike
+    logreg) can pick up threshold/interaction structure, which the SCM prior
+    can easily produce. Same feature encoding as the logreg baseline, so the
+    two numbers are directly comparable.
+    """
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+    except ImportError:
+        return None
+
+    features = _context_query_features(full, task)
+    if features is None:
+        return None
+    X_ctx, y_ctx, X_qry, y_qry = features
+
+    if len(np.unique(y_ctx)) < 2:
+        pred = np.full_like(y_qry, y_ctx[0])
+    else:
+        clf = RandomForestClassifier(n_estimators=200, max_depth=None, n_jobs=-1, random_state=0)
+        clf.fit(X_ctx, y_ctx)
+        pred = clf.predict(X_qry)
+
+    return float((pred == y_qry).mean())
+
+
+def xgb_context_baseline_acc(
+    full: FullSyntheticTable,
+    task: CompletionTask,
+) -> Optional[float]:
+    """
+    Same finite-context-oracle idea as logreg_context_baseline_acc, but
+    gradient-boosted trees (XGBoost) -- the standard strong non-in-context
+    tabular baseline, and typically the closest competitor to TabPFN-style
+    models in the literature. Same feature encoding as the logreg baseline.
+    """
+    try:
+        from xgboost import XGBClassifier
+    except ImportError:
+        return None
+
+    features = _context_query_features(full, task)
+    if features is None:
+        return None
+    X_ctx, y_ctx, X_qry, y_qry = features
+
+    n_classes = int(np.unique(y_ctx).size)
+    if n_classes < 2:
+        pred = np.full_like(y_qry, y_ctx[0])
+    else:
+        clf = XGBClassifier(
+            n_estimators=200,
+            max_depth=6,
+            learning_rate=0.1,
+            n_jobs=-1,
+            verbosity=0,
+            random_state=0,
+        )
+        clf.fit(X_ctx, y_ctx)
+        pred = clf.predict(X_qry)
+
+    return float((pred == y_qry).mean())
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -433,19 +591,36 @@ def evaluate(
 
     eval_table_generator = None
     if args.data_mode == "fresh_table":
-        eval_table_generator = SyntheticTableGenerator(
-            SyntheticTableGeneratorConfig(
-                n_rows=args.fresh_n_rows,
-                n_cols=args.n_cols,
-                p_categorical=args.p_categorical,
-                k_max=args.k_max,
-                n_classes=args.n_classes,
-                target_col=args.target_col,
-                latent_dim=args.latent_dim,
-                noise=args.data_noise,
-                base_seed=args.eval_seed,
+        if args.data_prior == "tabpfn":
+            eval_table_generator = TabPFNSCMTableGenerator(
+                TabPFNSCMConfig(
+                    n_rows=args.fresh_n_rows,
+                    n_cols=args.n_cols,
+                    p_categorical=args.p_categorical,
+                    k_max=args.k_max,
+                    n_classes=args.n_classes,
+                    target_col=args.target_col,
+                    base_seed=args.eval_seed,
+                    prior_type=args.tabpfn_prior_type,
+                    layers_mu_max=args.tabpfn_layers_mu_max,
+                    layers_max=args.tabpfn_layers_max,
+                    hidden_mu_max=args.tabpfn_hidden_mu_max,
+                )
             )
-        )
+        else:
+            eval_table_generator = SyntheticTableGenerator(
+                SyntheticTableGeneratorConfig(
+                    n_rows=args.fresh_n_rows,
+                    n_cols=args.n_cols,
+                    p_categorical=args.p_categorical,
+                    k_max=args.k_max,
+                    n_classes=args.n_classes,
+                    target_col=args.target_col,
+                    latent_dim=args.latent_dim,
+                    noise=args.data_noise,
+                    base_seed=args.eval_seed,
+                )
+            )
 
     all_metrics: Dict[str, float] = {}
 
@@ -465,7 +640,13 @@ def evaluate(
             task = sampler.sample(info, eval_rng)
             plan = factorizer.build(task, eval_rng)
 
-            loss_out = compute_task_loss(
+            if args.architecture == "two_stream_ar":
+                loss_fn = compute_task_loss_onepass
+            elif args.architecture == "single_stream":
+                loss_fn = compute_task_loss_single_stream
+            else:
+                loss_fn = compute_task_loss
+            loss_out = loss_fn(
                 model=model,
                 full=full,
                 task=task,
@@ -478,8 +659,44 @@ def evaluate(
             for key, value in loss_out.metrics.items():
                 values_by_metric.setdefault(key, []).append(float(value))
 
+            if task_name == "target":
+                baseline_acc = logreg_context_baseline_acc(full, task)
+                if baseline_acc is not None:
+                    values_by_metric.setdefault("logreg128_acc", []).append(baseline_acc)
+                rf_acc = rf_context_baseline_acc(full, task)
+                if rf_acc is not None:
+                    values_by_metric.setdefault("rf128_acc", []).append(rf_acc)
+                xgb_acc = xgb_context_baseline_acc(full, task)
+                if xgb_acc is not None:
+                    values_by_metric.setdefault("xgb128_acc", []).append(xgb_acc)
+
+        # cat_acc/loss_cat and num_mse/loss_num are set to a sentinel 0.0 on
+        # episodes with zero cells of that type (see typed_mse_ce_loss). A
+        # plain np.mean over episodes silently averages those sentinel zeros
+        # in as if they were real accuracy/loss values, which understates
+        # samplers (e.g. column_block) where many episodes land on a column
+        # of the other type. Weight by the matching cell count instead, so
+        # zero-cell episodes get zero weight rather than counting as a 0.
+        cell_weighted = {
+            "cat_acc": "cat_cells",
+            "loss_cat": "cat_cells",
+            "num_mse": "num_cells",
+            "loss_num": "num_cells",
+        }
+
         for key, values in values_by_metric.items():
-            all_metrics[f"eval/{task_name}/{key}"] = float(np.mean(values))
+            weight_key = cell_weighted.get(key)
+            weights = values_by_metric.get(weight_key) if weight_key else None
+
+            if weights is not None:
+                total_weight = sum(weights)
+                if total_weight > 0:
+                    weighted_sum = sum(v * w for v, w in zip(values, weights))
+                    all_metrics[f"eval/{task_name}/{key}"] = weighted_sum / total_weight
+                else:
+                    all_metrics[f"eval/{task_name}/{key}"] = 0.0
+            else:
+                all_metrics[f"eval/{task_name}/{key}"] = float(np.mean(values))
 
     model.train()
     return all_metrics
@@ -565,6 +782,40 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--data-prior",
+        type=str,
+        default="simple",
+        choices=["simple", "tabpfn"],
+        help=(
+            "simple: the original latent-factor generator (synthetic_data.py). "
+            "tabpfn: the SCM/BNN-mixture prior (synthetic_data_tabpfn.py), "
+            "richer and with a real accuracy ceiling by construction -- see "
+            "that module's docstring. Only wired up for --data-mode fresh_table."
+        ),
+    )
+    parser.add_argument(
+        "--tabpfn-prior-type", type=str, default="mixed",
+        choices=["scm", "bnn", "mixed"],
+        help="TabPFNSCMConfig.prior_type (default mixed = 50/50 SCM/BNN, "
+             "per the paper). Set scm or bnn to use only that branch.",
+    )
+    parser.add_argument(
+        "--tabpfn-layers-mu-max", type=float, default=6.0,
+        help="TabPFNSCMConfig.layers_mu_max (default 6.0). Lower = shallower "
+             "sampled graphs -- the TNLU mean-depth ceiling, not a hard cap.",
+    )
+    parser.add_argument(
+        "--tabpfn-layers-max", type=int, default=None,
+        help="TabPFNSCMConfig.layers_max: hard ceiling on sampled depth. "
+             "layers_mu_max alone can't guarantee a max (unbounded-above "
+             "truncated normal); set this when you need a real cap.",
+    )
+    parser.add_argument(
+        "--tabpfn-hidden-mu-max", type=float, default=130.0,
+        help="TabPFNSCMConfig.hidden_mu_max (default 130.0). Lower = narrower "
+             "sampled graphs.",
+    )
+    parser.add_argument(
         "--fresh-n-rows",
         type=int,
         default=256,
@@ -641,14 +892,123 @@ def parse_args():
     parser.add_argument("--group-size", type=int, default=1)
 
     # Model
+    parser.add_argument(
+        "--architecture",
+        type=str,
+        default="one_stream",
+        choices=["one_stream", "two_stream_ar", "single_stream"],
+        help=(
+            "one_stream = original CellwiseCompletionModel: row-encoder + "
+            "mean-pooled row-context/column aggregation, AR factorization "
+            "trained via a sequential loop (one forward+backward pass per "
+            "AR step -- correct but O(num_steps), impractical for "
+            "cell-wise AR on tasks with many query cells (e.g. random_cell). "
+            "two_stream_ar = PermARCompletionModel (src/tab_completion/"
+            "model_perm_ar.py): axial two-stream attention driven by a "
+            "per-cell reveal-rank tensor, scores every query cell of an "
+            "episode in a single forward pass regardless of factorization "
+            "or unit. Not numerically equivalent to one_stream even at "
+            "parallel factorization -- it's a different architecture, not "
+            "just a faster implementation of the same one. "
+            "single_stream = SingleStreamModel (src/tab_completion/"
+            "model_single_stream.py): TabPFN-v1-style one-token-per-cell "
+            "axial attention with context/query row masking, built from our "
+            "own value encoders/decode heads plus the informative "
+            "context-derived query placeholder. Parallel-factorization only "
+            "-- no reveal-order support, see that file's module docstring "
+            "for why. --batched-forward is required (no per-task fallback "
+            "path is implemented for this architecture)."
+        ),
+    )
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--max-episode-rows", type=int, default=512)
     parser.add_argument("--max-cols", type=int, default=128)
     parser.add_argument("--num-cat-decode-types", type=int, default=128)
-    parser.add_argument("--num-row-layers", type=int, default=2)
-    parser.add_argument("--num-row-context-layers", type=int, default=1)
+    # 8/8 (equal) as of 2026-08-09: matches --tabpfn-style-layers now
+    # defaulting on, which requires num_row_layers == num_row_context_layers.
+    # Also the depth this codebase's SCM-prior investigation settled on --
+    # matches tabpfn_v1_ref's attention depth (16 ops via 8 paired blocks).
+    parser.add_argument("--num-row-layers", type=int, default=8)
+    parser.add_argument("--num-row-context-layers", type=int, default=8)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
+    # The six flags below default ON as of 2026-08-09 -- this is the
+    # architecture the SCM-prior investigation settled on (see the run
+    # log/report). Each still accepts an explicit --no-<flag> to opt back
+    # out for a one-off ablation.
+    parser.add_argument(
+        "--context-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="single_stream/two_stream_ar only: re-standardize x_num (and, "
+             "if --unified-cat-encoding is also set, the cast-to-float "
+             "categorical values too) per episode using observed(context)-"
+             "only mean/std (mirrors TabPFNV1Model's FeatureEncoder). "
+             "Ignored by the original architecture. Default on -- pass "
+             "--no-context-normalize to opt out.",
+    )
+    parser.add_argument(
+        "--unified-cat-encoding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="single_stream/two_stream_ar only: drop cat_value_emb and "
+             "encode categorical cells by casting their raw id to float "
+             "through the same num_value_mlp as numerics (TabPFNV1Model's "
+             "actual recipe). Ignored by the original architecture. "
+             "Default on -- pass --no-unified-cat-encoding to opt out.",
+    )
+    parser.add_argument(
+        "--shared-cat-decoder",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use one shared [k_max, d] categorical decode matrix instead "
+             "of one private slice per column. Cardinality masking is "
+             "unaffected either way. Default on -- pass "
+             "--no-shared-cat-decoder to opt out. NOTE: also affects the "
+             "original one_stream architecture (shared TypedCategoricalHead) "
+             "-- that architecture was never part of the ablation that "
+             "validated this default.",
+    )
+    parser.add_argument(
+        "--tabpfn-style-layers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="single_stream/two_stream_ar only: row-attn, col-attn, THEN "
+             "one FFN application per paired block (TabPFNV1Layer's "
+             "layout) instead of an FFN after every single-axis attention. "
+             "Requires --num-row-layers == --num-row-context-layers (both "
+             "default to 8). Default on -- pass --no-tabpfn-style-layers "
+             "to opt out (remember to also set unequal layer counts back "
+             "if you want the old alternating-axis default shape).",
+    )
+    parser.add_argument(
+        "--share-stream-attn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="two_stream_ar only: share attention (and FFN) weights "
+             "between the content and query streams, XLNet-style, instead "
+             "of separate content/query parameter sets. Same activations "
+             "(attention still runs twice), half the attention+FFN params. "
+             "Harmless/inert for single_stream and one_stream. Default on "
+             "-- pass --no-share-stream-attn to opt out.",
+    )
+    parser.add_argument(
+        "--drop-type-origin-emb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="single_stream/two_stream_ar only: drop type_emb (num vs cat) "
+             "and origin_emb (observed vs query-this-episode) entirely -- "
+             "no additive signal beyond the value encoding itself, matching "
+             "TabPFNV1's lack of any such flag. Default on -- pass "
+             "--no-drop-type-origin-emb to opt out.",
+    )
+    parser.add_argument(
+        "--post-ln",
+        action="store_true",
+        help="single_stream only: post-LN (attn/ffn on raw input, residual "
+             "add, THEN LayerNorm) instead of this codebase's default "
+             "pre-LN -- matches TabPFNV1Layer's actual layout exactly.",
+    )
 
     # Train
     parser.add_argument("--steps", type=int, default=10_000)
@@ -661,9 +1021,41 @@ def parse_args():
             "They are looped over separately, so they may have different shapes."
         ),
     )
+    parser.add_argument(
+        "--batched-forward",
+        action="store_true",
+        help=(
+            "Stack the --batch-tasks sampled episodes into one real [B, N, D] "
+            "tensor and call the model once, instead of looping the model "
+            "once per task at B=1. Same gradient math (both average B "
+            "independently-sampled episode losses before backward), much "
+            "better GPU utilization. Only valid for --architecture "
+            "two_stream_ar with a sampler/factorization where every episode "
+            "has the same (N, D) shape -- true for TargetPredictionSampler + "
+            "ParallelFactorizer (every run this flag has been used for), NOT "
+            "true for samplers with a per-episode-variable query-cell/column "
+            "count (RandomCellSampler, ColumnBlockSampler) or perm-AR plans "
+            "with a per-episode-variable step count. Raises if the shapes "
+            "in a batch don't actually match, rather than silently falling "
+            "back.",
+        ),
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--warmup-steps", type=int, default=0,
+        help="Linear LR warmup from 0 to --lr over this many steps, then "
+             "cosine decay to --lr * --lr-min-ratio over the rest of "
+             "--steps (same recipe as the TabPFN paper: 'linear-warmup and "
+             "cosine annealing'). 0 disables the schedule -- flat --lr the "
+             "whole run, the original behavior.",
+    )
+    parser.add_argument(
+        "--lr-min-ratio", type=float, default=0.1,
+        help="Cosine decay floor, as a fraction of --lr. Only used when "
+             "--warmup-steps > 0.",
+    )
     parser.add_argument("--num-weight", type=float, default=1.0)
     parser.add_argument("--cat-weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -672,6 +1064,14 @@ def parse_args():
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--eval-tasks", type=int, default=20)
     parser.add_argument("--eval-seed", type=int, default=999)
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=10_000,
+        help="Save a model checkpoint every N steps, independent of "
+             "--eval-every -- so a long run always has durable, coarse "
+             "recovery points even if eval is frequent (many small "
+             "eval-triggered checkpoints) or the run is stopped early "
+             "between eval checkpoints. Set <=0 to disable.",
+    )
     parser.add_argument(
         "--eval-samplers",
         type=str,
@@ -775,6 +1175,10 @@ def main() -> None:
     print("=== Building synthetic data source ===")
 
     if args.data_mode == "fixed_table":
+        if args.data_prior == "tabpfn":
+            raise NotImplementedError(
+                "--data-prior tabpfn is only wired up for --data-mode fresh_table."
+            )
         full_fixed = make_synthetic_table(
             n_rows=args.n_rows,
             n_cols=args.n_cols,
@@ -797,21 +1201,38 @@ def main() -> None:
     else:
         full_fixed = None
 
-        table_generator = SyntheticTableGenerator(
-            SyntheticTableGeneratorConfig(
-                n_rows=args.fresh_n_rows,
-                n_cols=args.n_cols,
-                p_categorical=args.p_categorical,
-                k_max=args.k_max,
-                n_classes=args.n_classes,
-                target_col=args.target_col,
-                latent_dim=args.latent_dim,
-                noise=args.data_noise,
-                base_seed=args.data_seed,
+        if args.data_prior == "tabpfn":
+            table_generator = TabPFNSCMTableGenerator(
+                TabPFNSCMConfig(
+                    n_rows=args.fresh_n_rows,
+                    n_cols=args.n_cols,
+                    p_categorical=args.p_categorical,
+                    k_max=args.k_max,
+                    n_classes=args.n_classes,
+                    target_col=args.target_col,
+                    base_seed=args.data_seed,
+                    prior_type=args.tabpfn_prior_type,
+                    layers_mu_max=args.tabpfn_layers_mu_max,
+                    layers_max=args.tabpfn_layers_max,
+                    hidden_mu_max=args.tabpfn_hidden_mu_max,
+                )
             )
-        )
+        else:
+            table_generator = SyntheticTableGenerator(
+                SyntheticTableGeneratorConfig(
+                    n_rows=args.fresh_n_rows,
+                    n_cols=args.n_cols,
+                    p_categorical=args.p_categorical,
+                    k_max=args.k_max,
+                    n_classes=args.n_classes,
+                    target_col=args.target_col,
+                    latent_dim=args.latent_dim,
+                    noise=args.data_noise,
+                    base_seed=args.data_seed,
+                )
+            )
 
-        print("data_mode=fresh_table")
+        print(f"data_mode=fresh_table data_prior={args.data_prior}")
         print(
             f"fresh table config: n_rows={args.fresh_n_rows}, "
             f"n_cols={args.n_cols}, target_col={args.target_col}"
@@ -831,9 +1252,32 @@ def main() -> None:
         num_row_context_layers=args.num_row_context_layers,
         n_heads=args.n_heads,
         dropout=args.dropout,
+        context_normalize=args.context_normalize,
+        unified_cat_encoding=args.unified_cat_encoding,
+        shared_cat_decoder=args.shared_cat_decoder,
+        tabpfn_style_layers=args.tabpfn_style_layers,
+        share_stream_attn=args.share_stream_attn,
+        drop_type_origin_emb=args.drop_type_origin_emb,
+        post_ln=args.post_ln,
     )
 
-    model = CellwiseCompletionModel(model_cfg).to(device)
+    if args.architecture == "single_stream" and not args.batched_forward:
+        raise ValueError(
+            "--architecture single_stream requires --batched-forward -- no "
+            "per-task fallback path is implemented for this architecture."
+        )
+    if args.batched_forward and args.architecture not in ("two_stream_ar", "single_stream"):
+        raise ValueError("--batched-forward requires --architecture two_stream_ar or single_stream.")
+
+    if args.architecture == "two_stream_ar":
+        model = PermARCompletionModel(model_cfg).to(device)
+        loss_fn = compute_task_loss_onepass
+    elif args.architecture == "single_stream":
+        model = SingleStreamModel(model_cfg).to(device)
+        loss_fn = compute_task_loss_single_stream
+    else:
+        model = CellwiseCompletionModel(model_cfg).to(device)
+        loss_fn = compute_task_loss
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -841,8 +1285,30 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
+    scheduler = None
+    if args.warmup_steps > 0:
+        warmup_steps = args.warmup_steps
+        total_steps = args.steps
+        min_ratio = args.lr_min_ratio
+
+        def lr_lambda(step: int) -> float:
+            # step is 0-indexed by LambdaLR (called with last_epoch, starting
+            # at 0 before the first optimizer.step()).
+            if step < warmup_steps:
+                return (step + 1) / max(warmup_steps, 1)
+            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        print(f"lr_schedule=warmup({warmup_steps})+cosine(floor={min_ratio}*lr)")
+    else:
+        print("lr_schedule=none (flat lr)")
+
     n_params = sum(p.numel() for p in model.parameters())
 
+    print(f"architecture={args.architecture}")
     print(f"device={device}")
     print(f"params={n_params:,}")
     print(f"run_dir={out_dir}")
@@ -864,36 +1330,83 @@ def main() -> None:
         task_names: list[str] = []
         plan_modes: list[str] = []
 
-        for _ in range(args.batch_tasks):
-            if args.data_mode == "fixed_table":
-                assert full_fixed is not None
-                full = full_fixed
-            else:
-                assert table_generator is not None
-                full = table_generator.sample_table()
+        if args.batched_forward:
+            # Sample all B episodes first, then one real [B, N, D] forward
+            # pass instead of B sequential B=1 passes -- see
+            # compute_task_loss_onepass_batched's docstring for why this is
+            # equivalent gradient math, just much better GPU utilization.
+            full_batch = []
+            task_batch = []
+            plan_batch = []
+            for _ in range(args.batch_tasks):
+                if args.data_mode == "fixed_table":
+                    assert full_fixed is not None
+                    full = full_fixed
+                else:
+                    assert table_generator is not None
+                    full = table_generator.sample_table()
 
-            info = full.table_info()
+                info = full.table_info()
+                task = sampler.sample(info, np_rng)
+                plan = factorizer.build(task, np_rng)
 
-            task = sampler.sample(info, np_rng)
-            plan = factorizer.build(task, np_rng)
+                full_batch.append(full)
+                task_batch.append(task)
+                plan_batch.append(plan)
 
-            loss_out = compute_task_loss(
+            batched_loss_fn = (
+                compute_task_loss_single_stream_batched
+                if args.architecture == "single_stream"
+                else compute_task_loss_onepass_batched
+            )
+            loss_out = batched_loss_fn(
                 model=model,
-                full=full,
-                task=task,
-                plan=plan,
+                full_list=full_batch,
+                task_list=task_batch,
+                plan_list=plan_batch,
                 device=device,
                 num_weight=args.num_weight,
                 cat_weight=args.cat_weight,
             )
 
-            task_losses.append(loss_out.loss)
-            task_metric_rows.append(loss_out.metrics)
-            task_names.append(task.task_name)
-            plan_modes.append(plan.mode)
+            task_losses = [loss_out.loss]
+            task_metric_rows = [loss_out.metrics]
+            task_names = [task_batch[0].task_name]
+            plan_modes = [plan_batch[0].mode]
 
-        loss = torch.stack(task_losses).mean()
-        loss.backward()
+            loss = loss_out.loss
+            loss.backward()
+        else:
+            for _ in range(args.batch_tasks):
+                if args.data_mode == "fixed_table":
+                    assert full_fixed is not None
+                    full = full_fixed
+                else:
+                    assert table_generator is not None
+                    full = table_generator.sample_table()
+
+                info = full.table_info()
+
+                task = sampler.sample(info, np_rng)
+                plan = factorizer.build(task, np_rng)
+
+                loss_out = loss_fn(
+                    model=model,
+                    full=full,
+                    task=task,
+                    plan=plan,
+                    device=device,
+                    num_weight=args.num_weight,
+                    cat_weight=args.cat_weight,
+                )
+
+                task_losses.append(loss_out.loss)
+                task_metric_rows.append(loss_out.metrics)
+                task_names.append(task.task_name)
+                plan_modes.append(plan.mode)
+
+            loss = torch.stack(task_losses).mean()
+            loss.backward()
 
         if args.grad_clip is not None and args.grad_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -904,6 +1417,8 @@ def main() -> None:
             grad_norm = torch.tensor(0.0)
 
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if step % args.log_every == 0 or step == 1:
             now = time.time()
@@ -926,6 +1441,7 @@ def main() -> None:
                 "ar_unit": args.ar_unit,
                 "loss": float(loss.detach().cpu()),
                 "grad_norm": float(grad_norm.detach().cpu()),
+                "lr": optimizer.param_groups[0]["lr"],
                 "steps_per_sec": args.log_every / max(elapsed_since_log, 1e-8),
                 "elapsed_sec": time.time() - start_time,
                 "task_names": ",".join(task_names),
@@ -942,6 +1458,7 @@ def main() -> None:
             print(
                 f"[step {step:06d}] "
                 f"loss={row['loss']:.4f} "
+                f"lr={row['lr']:.2e} "
                 f"sampler={args.sampler} "
                 f"factorization={args.factorization} "
                 f"steps/s={row['steps_per_sec']:.2f}"
@@ -995,8 +1512,32 @@ def main() -> None:
                     key.endswith("/loss")
                     or key.endswith("/cat_acc")
                     or key.endswith("/num_mse")
+                    or key.endswith("/logreg128_acc")
+                    or key.endswith("/rf128_acc")
+                    or key.endswith("/xgb128_acc")
                 ):
                     print(f"  {key}: {value:.4f}")
+
+        # Independent periodic checkpoint, decoupled from eval cadence. Skip
+        # if this step already got a checkpoint from the eval block above.
+        if (
+            args.checkpoint_every > 0
+            and step % args.checkpoint_every == 0
+            and step % args.eval_every != 0
+            and step != args.steps
+        ):
+            ckpt_path = out_dir / f"checkpoint_step_{step}.pt"
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "step": step,
+                    "args": vars(args),
+                    "model_cfg": model_cfg.__dict__,
+                },
+                ckpt_path,
+            )
+            print(f"[checkpoint step {step:06d}] saved {ckpt_path}")
 
     if wandb_run is not None:
         wandb_run.finish()
