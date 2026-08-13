@@ -179,6 +179,42 @@ class ModelConfig:
     # further, where pre-LN's stability advantage matters more than at the
     # 6-16 layers tested so far. Worth revisiting with --post-ln per run.
     post_ln: bool = False
+    # PermARCompletionModel (sparse) only: after row-axis and col-axis
+    # attention, each sparse query cell does one additional attention pass
+    # directly against the ENTIRE flattened content grid for its own episode
+    # (masked to rank(content) < rank(query)), instead of relying on row/col
+    # axial attention alone. Fixes a real gap: under cell-wise axial AR, an
+    # earlier-revealed target cell p=(i',j') can only reach a later query
+    # q=(i,j) (i'!=i, j'!=j) through a bridge cell sharing a row or column
+    # with each -- but the causal mask forbids any rank-0 (observed) content
+    # cell from ever attending to a rank>=1 (revealed) cell, at ANY layer,
+    # so a bridge only exists if it happens to itself be a later-or-equal-
+    # rank target. Verified via perturbation test: an off-row/off-col
+    # earlier target has EXACTLY ZERO effect on a query's prediction without
+    # this flag. Content itself still only updates via row/col (this fixes
+    # query-side access, not content-to-content propagation) -- sufficient
+    # since only the query stream's final state gets decoded into a
+    # prediction. Cost is O(Q*N*D) per layer (Q sparse queries against the
+    # flattened N*D content grid), not O((N*D)^2) -- tractable specifically
+    # because the query side stays sparse. Moot for factorization=parallel
+    # (every query shares rank 1, so there's no "earlier target" to bridge
+    # to) and for target-style single-column prediction (all queries share
+    # one column, so col-axis attention already gives direct access) --
+    # matters for factorization=perm_ar with scattered query cells (e.g.
+    # random_cell + ar_unit=cell). DEFAULT OFF: opt in and re-measure
+    # memory/speed before relying on it.
+    global_query_bridge: bool = False
+    # PermARCompletionModel (sparse) only: checkpoint each paired row+col+FFN
+    # block instead of retaining its internal activations for backward --
+    # trade recompute (rerun the block's forward during backward) for memory
+    # (only the block's input/output boundary is retained, not every Q/K/V,
+    # attention output, FFN hidden state, and normalized tensor inside it).
+    # Pure memory/compute tradeoff, no effect on the forward computation or
+    # its numerical result -- verify this holds (checkpointed vs. not,
+    # matching seed) before trusting it in a new setting. Only applies
+    # during training (checkpointing an eval-mode forward with no backward
+    # coming is pure waste). DEFAULT OFF.
+    activation_checkpointing: bool = False
 
 
 class CellTokenizer(nn.Module):

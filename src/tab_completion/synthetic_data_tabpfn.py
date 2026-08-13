@@ -28,19 +28,44 @@ THE REALIZED VALUES themselves (not fixed quantiles) and then shuffling
 the resulting class ids, per Section 4.5 / C.2.5 -- this is also why some
 generated tables land on imbalanced classes; that's intended, not a bug.
 
-Known deviations from the paper, and why:
-  - `p_edge_dropout` and `p_root_importance` are NOT literal Table 5
-    switches. The paper's edge dropout rate is already continuous
-    (0.9 * Beta(a, b), which can itself land near zero), and C.2.3
-    describes root-feature-importance amplification as a standing part of
-    the generation recipe, not something toggled off some fraction of the
-    time. These two gates are deliberate extensions for extra prior
-    diversity, kept as a conscious choice -- not something we're claiming
-    is paper-faithful.
-  - "Sample y from last MLP layer" (Table 5) is not implemented: target
-    selection here has no relationship to graph depth, so the target is as
-    likely to land on a shallow/root node as a deep one. Left as a known
-    gap rather than guessed at.
+Paper fidelity, as of 2026-08-12:
+  - `p_edge_dropout` and `p_root_importance` now default to 1.0 (always
+    active), matching the paper: edge dropout is a continuous
+    0.9 * Beta(a, b) formula with no separate switch, and C.2.3 describes
+    root-feature-importance amplification as standing behavior, not
+    something toggled off some fraction of the time. (Previously both
+    defaulted to 0.75 as a deliberate, documented deviation for extra prior
+    diversity -- kept as overridable fields if you want that back.)
+  - "Sample y from last MLP layer" (Table 5) is now implemented via
+    `p_y_from_last_layer` (default 0.5, matching the paper's unweighted
+    coin flip) -- see `select_feature_target_nodes`.
+  - "Blockwise Dropout" (Table 5) is now implemented via
+    `p_blockwise_dropout` (default 0.5): block-diagonal weight-matrix
+    connectivity (per-matrix n_blocks ~ UniformInt(1, ceil(sqrt(min(fan_in,
+    fan_out)))), shared True/False choice across the whole graph) instead
+    of independent-per-edge Bernoulli masking, with 1/sqrt(q)-compensated
+    weight scale so output variance stays constant regardless of sparsity
+    pattern -- verified by simulation, not just derivation. Both this and
+    ordinary dropout now also correctly skip dropout entirely on the first
+    weight matrix in the non-blockwise branch, matching the reference
+    implementation (blockwise mode has no such exception -- it applies to
+    every matrix). See `sample_scm_graph`. Reconstructed from the released
+    prior implementation, not the paper's prose (Table 5 gives no mechanism
+    for this entry, and the paper text alone doesn't specify it).
+  - `n_classes` is now sampled per table via `sample_n_classes` (two-stage,
+    binary-heavy: ~61% K=2, decaying through K=10), matching the reference
+    training config rather than this module's previous fixed default of 2.
+    The paper's Section 4.5 states Nc is sampled but doesn't give the exact
+    formula in the accessible text; this reproduces the actual
+    implementation's scheme instead.
+
+Known remaining simplification: when a sampled graph doesn't have enough
+total nodes for n_cols, `sample_scm_graph` widens the last layer to fit
+rather than resampling until a naturally-large-enough graph is drawn. Left
+as-is deliberately -- under this module's still-fairly-narrow width/depth
+ranges, resampling would hit its own fallback (and still widen) on the
+large majority of draws anyway, so it wouldn't meaningfully change behavior
+without also widening those ranges further.
 
 Expect a real, non-trivial accuracy ceiling from this prior, and don't
 assume a stuck-looking training curve means another bug: unlike the
@@ -129,7 +154,23 @@ class TabPFNSCMConfig:
     target_col: Optional[int] = None
     p_categorical: float = 0.2
     k_max: int = 16
-    n_classes: int = 2
+    # None = sample per table via sample_n_classes (the paper's actual
+    # two-stage, binary-heavy scheme -- see that function's docstring). Set
+    # an explicit int to force a fixed class count instead (e.g. for eval
+    # reproducibility).
+    n_classes: Optional[int] = None
+    # Stage 1: nominal max classes M = round(Uniform(n_classes_max_min,
+    # n_classes_max_max)). Stage 2: with probability p_force_binary, K=2;
+    # else K = round(Uniform(2, M)). Reproduces the reference TabPFN v1
+    # training config (max_num_classes=10, the two nested
+    # uniform_int_sampler_f calls) -- NOT literal Table 5 (the paper states
+    # "sample Nc ~ p(Nc)" without giving the exact formula in the appendix
+    # text; this is the public implementation's actual scheme, verified by
+    # simulation to reproduce ~61.4%/13.5%/8.8%/6.2%/4.4%/3.0%/1.8%/0.8%/0.2%
+    # for K=2..10).
+    n_classes_max_min: int = 2
+    n_classes_max_max: int = 10
+    p_force_binary: float = 0.5
     base_seed: int = 0
 
     # Which prior branch to use.
@@ -144,10 +185,30 @@ class TabPFNSCMConfig:
     p_keep_feature_order: float = 0.5
     p_feature_scaling: float = 0.5
 
-    # NOT literal Table 5 switches -- see module docstring "Known deviations".
-    # Kept as deliberate, documented extensions for extra prior diversity.
-    p_root_importance: float = 0.75
-    p_edge_dropout: float = 0.75
+    # Paper-exact as of 2026-08-12 (previously 0.75/0.75, a deliberate
+    # deviation -- see module docstring "Known deviations" history). Table 5's
+    # MLP weight dropout is a continuous 0.9*Beta(a,b) formula with no
+    # separate on/off switch (C.2.3 describes root-importance amplification
+    # in prose as standing behavior, not gated by a probability), so both are
+    # now always active, matching the paper.
+    p_root_importance: float = 1.0
+    p_edge_dropout: float = 1.0
+    # Table 5: "Sample y from last MLP layer: Uniform Choice {True, False}".
+    # When True, the target node is drawn from the graph's final layer
+    # instead of anywhere in the assembled index list -- see
+    # select_feature_target_nodes. Previously unimplemented (see that
+    # function's prior docstring); paper default is an unweighted coin flip.
+    p_y_from_last_layer: float = 0.5
+    # Table 5: "Blockwise Dropout: Uniform Choice {True, False}". Once per
+    # table (shared across every weight matrix in the graph): if True, each
+    # weight matrix is built block-diagonal (n_blocks sampled independently
+    # per matrix) instead of independently-per-edge Bernoulli-masked --
+    # groups of nodes then only connect to the matching group in the next
+    # layer, creating causal "modules" rather than uniformly-random sparse
+    # connectivity. See sample_scm_graph for the reference formula (verified
+    # against the released prior implementation, not guessed from the bare
+    # Table 5 entry -- the paper's own text doesn't describe the mechanism).
+    p_blockwise_dropout: float = 0.5
 
     # SCM structure (Table 5)
     layers_mu_min: float = 1.0
@@ -191,6 +252,7 @@ class SCMGraph:
     node_noise_stds: List[np.ndarray]
     used_edge_dropout: bool
     used_root_importance: bool
+    used_blockwise_dropout: bool
 
     @property
     def total_nodes(self) -> int:
@@ -226,13 +288,14 @@ def sample_scm_graph(
     activation = str(rng.choice(ACTIVATIONS))
 
     used_edge_dropout = rng.random() < cfg.p_edge_dropout
-    if used_edge_dropout:
+    used_blockwise_dropout = used_edge_dropout and (rng.random() < cfg.p_blockwise_dropout)
+    if used_edge_dropout and not used_blockwise_dropout:
         dropout_a = rng.uniform(cfg.dropout_ab_min, cfg.dropout_ab_max)
         dropout_b = rng.uniform(cfg.dropout_ab_min, cfg.dropout_ab_max)
         edge_dropout_rate = 0.9 * rng.beta(dropout_a, dropout_b)
-        keep_prob = 1.0 - edge_dropout_rate
+        ordinary_keep_prob = 1.0 - edge_dropout_rate
     else:
-        keep_prob = 1.0
+        ordinary_keep_prob = 1.0
 
     # Fan-in normalized weight scale: without this, deep/wide graphs (widths
     # up to 130, depths up to ~20 are both in-range) can blow up in float32
@@ -240,12 +303,58 @@ def sample_scm_graph(
     # RuntimeWarning: overflow encountered in reduce during generation).
     # The BNN branch below already does this; apply the same fix here so
     # both branches are on equal numerical footing.
+    #
+    # Both branches below additionally divide by sqrt(q) (q = the fraction
+    # of a node's incoming connections that actually survive) on top of the
+    # 1/sqrt(fan_in) term: with N(0, weight_std^2/fan_in) entries kept with
+    # probability q, only ~fan_in*q terms survive per node, so the
+    # preactivation variance would shrink to weight_std^2*q without this --
+    # the extra 1/sqrt(q) exactly cancels that, keeping variance at
+    # weight_std^2 regardless of how sparse the connectivity ends up (this
+    # is also the reference implementation's own
+    # prior_mlp_scale_weights_sqrt behavior, confirmed by variance
+    # simulation, not just by inspection). Verified empirically: an
+    # unmasked node's true incoming-edge count is fan_in*q for ordinary
+    # dropout, or exactly n_blocks*block_in*block_out/fan_out (per output
+    # node) for the blockwise case -- both handled by computing q directly
+    # from the actual kept-entry count rather than assuming it hits 1/B
+    # exactly (integer division means it usually doesn't).
     weight_matrices: List[np.ndarray] = []
     for i in range(len(layer_sizes) - 1):
         fan_in = max(layer_sizes[i], 1)
-        W = rng.normal(0.0, weight_std / np.sqrt(fan_in), size=(layer_sizes[i], layer_sizes[i + 1])).astype(np.float32)
-        keep_mask = rng.random(W.shape) < keep_prob
-        weight_matrices.append(W * keep_mask)
+        fan_out = layer_sizes[i + 1]
+
+        if used_blockwise_dropout:
+            # Table 5: "Blockwise Dropout" -- block-diagonal connectivity
+            # instead of independently-random sparsity, so groups of nodes
+            # form causal modules (heavy within-group interaction, near-zero
+            # cross-group). n_blocks is resampled per weight matrix (only
+            # the True/False choice to use blockwise mode at all is shared
+            # across the whole graph).
+            n_blocks = int(rng.integers(1, int(np.ceil(np.sqrt(min(fan_in, fan_out)))) + 1))
+            block_in = max(fan_in // n_blocks, 1)
+            block_out = max(fan_out // n_blocks, 1)
+            n_blocks = min(n_blocks, fan_in // block_in, fan_out // block_out)
+            q = (n_blocks * block_in * block_out) / (fan_in * fan_out)
+            std = weight_std / np.sqrt(fan_in * q)
+
+            W = np.zeros((fan_in, fan_out), dtype=np.float32)
+            for b in range(n_blocks):
+                i0, i1 = b * block_in, (b + 1) * block_in
+                j0, j1 = b * block_out, (b + 1) * block_out
+                W[i0:i1, j0:j1] = rng.normal(0.0, std, size=(block_in, block_out)).astype(np.float32)
+            weight_matrices.append(W)
+        else:
+            # Reference implementation: the first weight matrix (layer0 ->
+            # first hidden layer) never gets ordinary dropout, only later
+            # ones do -- root/input connectivity stays fully dense.
+            q = 1.0 if i == 0 else ordinary_keep_prob
+            std = weight_std / np.sqrt(fan_in * q)
+            W = rng.normal(0.0, std, size=(fan_in, fan_out)).astype(np.float32)
+            if i > 0:
+                keep_mask = rng.random(W.shape) < q
+                W = W * keep_mask
+            weight_matrices.append(W)
 
     # C.2.3: amplify layer-0 (root) feature importances so effects don't
     # regress to the mean as hidden width grows -- some inputs end up
@@ -275,6 +384,7 @@ def sample_scm_graph(
         node_noise_stds=node_noise_stds,
         used_edge_dropout=used_edge_dropout,
         used_root_importance=used_root_importance,
+        used_blockwise_dropout=used_blockwise_dropout,
     )
 
 
@@ -381,37 +491,86 @@ def select_uniform_nodes(rng: np.random.Generator, layer_sizes: List[int], k: in
     return rng.choice(total, size=k, replace=False).astype(np.int64).tolist()
 
 
+def global_indices_for_layer(layer_sizes: List[int], layer_idx: int) -> List[int]:
+    """Global (flattened-across-layers) node indices belonging to one layer."""
+    start = int(sum(layer_sizes[:layer_idx]))
+    end = start + layer_sizes[layer_idx]
+    return list(range(start, end))
+
+
 def select_feature_target_nodes(
     rng: np.random.Generator,
     cfg: TabPFNSCMConfig,
     layer_sizes: List[int],
     k: int,
 ) -> Tuple[List[int], int, dict]:
-    """
-    Return feature node indices, target node index, and metadata.
-
-    Known gap (Table 5's "Sample y from last MLP layer" is not implemented):
-    the target is just whichever node lands last in the assembled index
-    list, with no relationship to graph depth -- it's as likely to be a
-    shallow/root node as a deep one.
-    """
+    """Return feature node indices, target node index, and metadata."""
     use_blockwise = rng.random() < cfg.p_blockwise_feature_sampling
     keep_order = rng.random() < cfg.p_keep_feature_order
+    y_from_last_layer = rng.random() < cfg.p_y_from_last_layer
 
-    if use_blockwise:
-        node_indices = select_blockwise_nodes(rng, layer_sizes, k)
+    total = int(sum(layer_sizes))
+
+    if y_from_last_layer:
+        last_layer_nodes = global_indices_for_layer(layer_sizes, len(layer_sizes) - 1)
+        target_node = int(rng.choice(last_layer_nodes))
+
+        if use_blockwise:
+            feature_nodes: List[int] = []
+            seen = {target_node}
+            # Bounded like select_blockwise_nodes's own internal retry loop --
+            # without a cap, a small/near-saturated graph (total close to k)
+            # could spin forever if repeated draws keep re-hitting nodes
+            # already in `seen`.
+            attempts = 0
+            max_attempts = 200
+            while len(feature_nodes) < k - 1 and attempts < max_attempts:
+                attempts += 1
+                for c in select_blockwise_nodes(rng, layer_sizes, k):
+                    if c not in seen:
+                        feature_nodes.append(c)
+                        seen.add(c)
+                        if len(feature_nodes) == k - 1:
+                            break
+            if len(feature_nodes) < k - 1:
+                # Fallback: fill the remainder uniformly from whatever's left.
+                remaining = [idx for idx in range(total) if idx not in seen]
+                rng.shuffle(remaining)
+                feature_nodes += remaining[: (k - 1) - len(feature_nodes)]
+        else:
+            candidates = [idx for idx in range(total) if idx != target_node]
+            if len(candidates) < k - 1:
+                raise ValueError(
+                    f"Cannot select {k - 1} feature nodes excluding the target "
+                    f"from a graph with {total} nodes."
+                )
+            feature_nodes = rng.choice(
+                candidates, size=k - 1, replace=False
+            ).astype(np.int64).tolist()
+
     else:
-        node_indices = select_uniform_nodes(rng, layer_sizes, k)
+        if use_blockwise:
+            node_indices = select_blockwise_nodes(rng, layer_sizes, k)
+        else:
+            node_indices = select_uniform_nodes(rng, layer_sizes, k)
+        # Target selection has no depth relationship here (the fallback
+        # behavior when y_from_last_layer doesn't fire): whichever node the
+        # blockwise/uniform draw happened to put last.
+        target_node = node_indices[-1]
+        feature_nodes = node_indices[:-1]
 
+    # keep_order controls FEATURE column order only -- target_node is fixed
+    # above in both branches and must never move relative to a shuffle
+    # (a prior version of this function shuffled node_indices as a whole
+    # THEN re-sliced [-1] as target, which would silently override a
+    # correctly-chosen last-layer target).
     if not keep_order:
-        rng.shuffle(node_indices)
-
-    target_node = node_indices[-1]
-    feature_nodes = node_indices[:-1]
+        rng.shuffle(feature_nodes)
 
     meta = {
         "use_blockwise_feature_sampling": use_blockwise,
         "keep_feature_order": keep_order,
+        "y_from_last_layer": y_from_last_layer,
     }
     return feature_nodes, target_node, meta
 
@@ -451,6 +610,27 @@ def maybe_scale_features(rng: np.random.Generator, cfg: TabPFNSCMConfig, X: np.n
     scales = np.exp(rng.normal(0.0, 1.0, size=X.shape[1])).astype(np.float32)
     shifts = rng.normal(0.0, 1.0, size=X.shape[1]).astype(np.float32)
     return X * scales[None, :] + shifts[None, :]
+
+
+def sample_n_classes(rng: np.random.Generator, cfg: TabPFNSCMConfig) -> int:
+    """
+    Per-table class count, reproducing the reference TabPFN v1 training
+    config's two-stage, binary-heavy scheme (not literal Table 5 -- the
+    paper states "sample Nc ~ p(Nc)" without giving the exact formula in the
+    appendix text; this is the public implementation's actual sampler):
+
+      1. M = round(Uniform(n_classes_max_min, n_classes_max_max)) -- a
+         nominal max class count (paper's max_num_classes=10 default).
+      2. With probability p_force_binary, K=2 outright; otherwise
+         K = round(Uniform(2, M)).
+
+    Verified by simulation to reproduce ~61.4%/13.5%/8.8%/6.2%/4.4%/3.0%/
+    1.8%/0.8%/0.2% for K=2..10 under the defaults.
+    """
+    m = round(float(rng.uniform(cfg.n_classes_max_min, cfg.n_classes_max_max)))
+    if rng.random() < cfg.p_force_binary:
+        return 2
+    return max(2, round(float(rng.uniform(2, m))))
 
 
 # ---------------------------------------------------------------------
@@ -494,9 +674,11 @@ def assemble_full_table_from_raw(
             mean, std = float(raw.mean()), float(raw.std())
             x_num[:, col] = (raw - mean) / (std + 1e-6)
 
-    y = bin_by_realized_values(rng, target_raw.astype(np.float32), cfg.n_classes)
+    n_classes = cfg.n_classes if cfg.n_classes is not None else sample_n_classes(rng, cfg)
+    n_classes = min(n_classes, cfg.k_max)  # cat_cardinalities must fit the shared decode head
+    y = bin_by_realized_values(rng, target_raw.astype(np.float32), n_classes)
     x_cat[:, target_col] = y
-    cat_cardinalities[target_col] = cfg.n_classes
+    cat_cardinalities[target_col] = n_classes
     col_types[target_col] = CATEGORICAL
     x_num[:, target_col] = 0.0
 

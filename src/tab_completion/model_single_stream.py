@@ -37,6 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from tab_completion.model import (
     NUMERICAL,
@@ -456,8 +457,17 @@ class SingleStreamModel(nn.Module):
         context_row_mask: Optional[torch.Tensor] = None,
     ) -> ModelOutput:
         x = self.tokenizer(batch, rank)
+        use_checkpoint = self.training and self.cfg.activation_checkpointing
         for layer in self.layers:
-            x = layer(x, rank, context_row_mask)
+            if use_checkpoint:
+                x = checkpoint(
+                    lambda x_in, _layer=layer: _layer(x_in, rank, context_row_mask),
+                    x,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                x = layer(x, rank, context_row_mask)
 
         h = self.final_norm(x)
         num_mu = self.num_head(h).squeeze(-1)

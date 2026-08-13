@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -63,6 +64,11 @@ from tab_completion.model_perm_ar import (
     compute_task_loss_onepass,
     compute_task_loss_onepass_batched,
 )
+from tab_completion.model_perm_ar_sparse import (
+    PermARCompletionModel as PermARCompletionModelSparse,
+    compute_task_loss_onepass as compute_task_loss_onepass_sparse,
+    compute_task_loss_onepass_batched as compute_task_loss_onepass_batched_sparse,
+)
 from tab_completion.model_single_stream import (
     SingleStreamModel,
     compute_task_loss_single_stream,
@@ -72,6 +78,19 @@ from tab_completion.synthetic_data_tabpfn import (
     TabPFNSCMConfig,
     TabPFNSCMTableGenerator,
 )
+
+
+def autocast_ctx(args, device: torch.device):
+    amp_torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.amp_dtype)
+    if amp_torch_dtype is None or device.type != "cuda":
+        return contextlib.nullcontext()
+    return torch.autocast(device_type="cuda", dtype=amp_torch_dtype)
+
+
+def sparse_partial_predict_kwargs(args, np_rng: np.random.Generator) -> Dict:
+    if args.architecture != "two_stream_ar_sparse" or args.max_predict_cells is None:
+        return {}
+    return {"max_predict_cells": args.max_predict_cells, "rng": np_rng}
 
 
 # ---------------------------------------------------------------------
@@ -642,19 +661,22 @@ def evaluate(
 
             if args.architecture == "two_stream_ar":
                 loss_fn = compute_task_loss_onepass
+            elif args.architecture == "two_stream_ar_sparse":
+                loss_fn = compute_task_loss_onepass_sparse
             elif args.architecture == "single_stream":
                 loss_fn = compute_task_loss_single_stream
             else:
                 loss_fn = compute_task_loss
-            loss_out = loss_fn(
-                model=model,
-                full=full,
-                task=task,
-                plan=plan,
-                device=device,
-                num_weight=args.num_weight,
-                cat_weight=args.cat_weight,
-            )
+            with autocast_ctx(args, device):
+                loss_out = loss_fn(
+                    model=model,
+                    full=full,
+                    task=task,
+                    plan=plan,
+                    device=device,
+                    num_weight=args.num_weight,
+                    cat_weight=args.cat_weight,
+                )
 
             for key, value in loss_out.metrics.items():
                 values_by_metric.setdefault(key, []).append(float(value))
@@ -896,7 +918,7 @@ def parse_args():
         "--architecture",
         type=str,
         default="one_stream",
-        choices=["one_stream", "two_stream_ar", "single_stream"],
+        choices=["one_stream", "two_stream_ar", "two_stream_ar_sparse", "single_stream"],
         help=(
             "one_stream = original CellwiseCompletionModel: row-encoder + "
             "mean-pooled row-context/column aggregation, AR factorization "
@@ -1008,6 +1030,29 @@ def parse_args():
         help="single_stream only: post-LN (attn/ffn on raw input, residual "
              "add, THEN LayerNorm) instead of this codebase's default "
              "pre-LN -- matches TabPFNV1Layer's actual layout exactly.",
+    )
+    parser.add_argument(
+        "--global-query-bridge",
+        action="store_true",
+        help="two_stream_ar_sparse (tabpfn_style_layers only) only: after "
+             "row+col axis attention each layer, each sparse query also "
+             "attends directly over the full flattened content grid for its "
+             "episode (masked to rank(content) < rank(query)), fixing a real "
+             "gap where an off-row/off-col earlier-revealed target under "
+             "perm_ar has no path to a later query (axial attention alone "
+             "can't bridge it -- verified via perturbation test). Moot for "
+             "factorization=parallel or single-column target prediction. "
+             "Adds an O(Q*N*D)-per-layer attention pass. Default off.",
+    )
+    parser.add_argument(
+        "--activation-checkpointing",
+        action="store_true",
+        help="two_stream_ar_sparse only: checkpoint each paired row+col+FFN "
+             "block (rerun its forward during backward instead of retaining "
+             "internal activations). Trades ~30-40%% more wall-clock for a "
+             "large memory cut across many stacked layers. Pure memory/"
+             "compute tradeoff -- does not change the forward computation. "
+             "Default off.",
     )
 
     # Train
@@ -1142,6 +1187,22 @@ def parse_args():
 
     # Device
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--max-predict-cells", type=int, default=None,
+        help="two_stream_ar_sparse only: XLNet-style partial prediction. "
+             "If set, subsample at most this many query cells per episode "
+             "(uniformly at random) and only compute g-states/loss for "
+             "those, instead of every cell in task.query_mask. Unbiased "
+             "since typed_mse_ce_loss already mean-reduces over queried "
+             "cells. Ignored by other architectures.",
+    )
+    parser.add_argument(
+        "--amp-dtype", type=str, default="none", choices=["none", "bf16", "fp16"],
+        help="Run the forward pass (model + loss) under torch.autocast in this "
+             "dtype. bf16 needs no GradScaler (same dynamic range as fp32); "
+             "fp16 is provided for comparison but has no GradScaler wired up "
+             "here, so it may underflow -- prefer bf16.",
+    )
 
     return parser.parse_args()
 
@@ -1259,6 +1320,8 @@ def main() -> None:
         share_stream_attn=args.share_stream_attn,
         drop_type_origin_emb=args.drop_type_origin_emb,
         post_ln=args.post_ln,
+        global_query_bridge=args.global_query_bridge,
+        activation_checkpointing=args.activation_checkpointing,
     )
 
     if args.architecture == "single_stream" and not args.batched_forward:
@@ -1266,12 +1329,20 @@ def main() -> None:
             "--architecture single_stream requires --batched-forward -- no "
             "per-task fallback path is implemented for this architecture."
         )
-    if args.batched_forward and args.architecture not in ("two_stream_ar", "single_stream"):
-        raise ValueError("--batched-forward requires --architecture two_stream_ar or single_stream.")
+    if args.batched_forward and args.architecture not in (
+        "two_stream_ar", "two_stream_ar_sparse", "single_stream",
+    ):
+        raise ValueError(
+            "--batched-forward requires --architecture two_stream_ar, "
+            "two_stream_ar_sparse, or single_stream."
+        )
 
     if args.architecture == "two_stream_ar":
         model = PermARCompletionModel(model_cfg).to(device)
         loss_fn = compute_task_loss_onepass
+    elif args.architecture == "two_stream_ar_sparse":
+        model = PermARCompletionModelSparse(model_cfg).to(device)
+        loss_fn = compute_task_loss_onepass_sparse
     elif args.architecture == "single_stream":
         model = SingleStreamModel(model_cfg).to(device)
         loss_fn = compute_task_loss_single_stream
@@ -1354,20 +1425,23 @@ def main() -> None:
                 task_batch.append(task)
                 plan_batch.append(plan)
 
-            batched_loss_fn = (
-                compute_task_loss_single_stream_batched
-                if args.architecture == "single_stream"
-                else compute_task_loss_onepass_batched
-            )
-            loss_out = batched_loss_fn(
-                model=model,
-                full_list=full_batch,
-                task_list=task_batch,
-                plan_list=plan_batch,
-                device=device,
-                num_weight=args.num_weight,
-                cat_weight=args.cat_weight,
-            )
+            if args.architecture == "single_stream":
+                batched_loss_fn = compute_task_loss_single_stream_batched
+            elif args.architecture == "two_stream_ar_sparse":
+                batched_loss_fn = compute_task_loss_onepass_batched_sparse
+            else:
+                batched_loss_fn = compute_task_loss_onepass_batched
+            with autocast_ctx(args, device):
+                loss_out = batched_loss_fn(
+                    model=model,
+                    full_list=full_batch,
+                    task_list=task_batch,
+                    plan_list=plan_batch,
+                    device=device,
+                    num_weight=args.num_weight,
+                    cat_weight=args.cat_weight,
+                    **sparse_partial_predict_kwargs(args, np_rng),
+                )
 
             task_losses = [loss_out.loss]
             task_metric_rows = [loss_out.metrics]
@@ -1390,15 +1464,17 @@ def main() -> None:
                 task = sampler.sample(info, np_rng)
                 plan = factorizer.build(task, np_rng)
 
-                loss_out = loss_fn(
-                    model=model,
-                    full=full,
-                    task=task,
-                    plan=plan,
-                    device=device,
-                    num_weight=args.num_weight,
-                    cat_weight=args.cat_weight,
-                )
+                with autocast_ctx(args, device):
+                    loss_out = loss_fn(
+                        model=model,
+                        full=full,
+                        task=task,
+                        plan=plan,
+                        device=device,
+                        num_weight=args.num_weight,
+                        cat_weight=args.cat_weight,
+                        **sparse_partial_predict_kwargs(args, np_rng),
+                    )
 
                 task_losses.append(loss_out.loss)
                 task_metric_rows.append(loss_out.metrics)
