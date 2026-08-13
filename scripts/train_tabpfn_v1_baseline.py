@@ -35,6 +35,7 @@ from tab_completion.synthetic_data import FullSyntheticTable
 from tab_completion.synthetic_data_tabpfn import TabPFNSCMConfig, TabPFNSCMTableGenerator
 
 from train_synthetic import (
+    autocast_ctx,
     logreg_context_baseline_acc,
     rf_context_baseline_acc,
     xgb_context_baseline_acc,
@@ -164,7 +165,8 @@ def evaluate(model, args, device) -> Dict[str, float]:
             eval_gen, eval_sampler, eval_rng, 1, args.eval_n_context, args.eval_n_query, device,
             baselines=True,
         )
-        logits = model(x_feat_t, y_ctx_t, args.eval_n_context, num_valid_classes=num_valid_classes_t)
+        with autocast_ctx(args, device):
+            logits = model(x_feat_t, y_ctx_t, args.eval_n_context, num_valid_classes=num_valid_classes_t)
         pred = logits.argmax(dim=-1)
         accs.append((pred == y_qry_t).float().mean().item())
         for k in baseline_accs:
@@ -220,6 +222,12 @@ def parse_args():
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--warmup-steps", type=int, default=1000)
     p.add_argument("--lr-min-ratio", type=float, default=0.1)
+
+    p.add_argument(
+        "--amp-dtype", type=str, choices=["none", "bf16", "fp16"], default="none",
+        help="Run the forward pass (model + loss) under torch.autocast in this "
+        "dtype. 'none' disables autocast (full fp32, the previous behavior).",
+    )
 
     p.add_argument("--out-dir", type=str, default="results/synthetic_v2")
     p.add_argument("--run-name", type=str, required=True)
@@ -288,6 +296,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print("=== TabPFN-v1-style reference model ===")
     print(f"device={device}")
+    print(f"amp_dtype={args.amp_dtype}")
     print(f"params={n_params:,}")
     print(f"run_dir={out_dir}")
 
@@ -304,13 +313,14 @@ def main():
             table_generator, sampler, np_rng, args.batch_tasks, args.n_context, args.n_query, device,
             baselines=False,
         )
-        logits = model(
-            x_feat_t, y_ctx_t, args.n_context, num_valid_classes=num_valid_classes_t
-        )  # [B, n_query, max_num_classes]
+        with autocast_ctx(args, device):
+            logits = model(
+                x_feat_t, y_ctx_t, args.n_context, num_valid_classes=num_valid_classes_t
+            )  # [B, n_query, max_num_classes]
 
-        loss = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, args.max_num_classes), y_qry_t.reshape(-1), ignore_index=-100
-        )
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, args.max_num_classes), y_qry_t.reshape(-1), ignore_index=-100
+            )
         loss.backward()
 
         if args.grad_clip > 0:

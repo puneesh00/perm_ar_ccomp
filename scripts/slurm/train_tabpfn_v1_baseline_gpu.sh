@@ -59,11 +59,13 @@ echo "in that episode's context rows (see build_xy / _flatten_multiclass_targets
 echo "in train_tabpfn_v1_baseline.py), same mechanism real TabPFN uses. Output"
 echo "slots beyond an episode's realized class count are masked to -inf."
 echo ""
-echo "This script has no bf16/activation-checkpointing support (unlike"
-echo "train_synthetic.py) -- not expected to matter here since this model"
-echo "processes one token per ROW (~513 tokens/episode), not one per CELL"
-echo "like our axial architecture (~513*64 tokens/episode), so its memory"
-echo "footprint at this table size should be far smaller regardless."
+echo "Running with --amp-dtype bf16. This model's datapoint_attn is plain"
+echo "nn.MultiheadAttention over N=~513 rows, folded batch*columns deep"
+echo "(B*65 independent attention instances per layer at these settings) --"
+echo "each materializes an [N,N] attention matrix, which adds up fast across"
+echo "8 layers even though there's only one token per row (not per cell like"
+echo "our axial model). fp32 OOM'd on a 40GB card even at batch_tasks=4;"
+echo "bf16 roughly halves activation memory and was needed to fit here."
 echo ""
 
 python scripts/train_tabpfn_v1_baseline.py \
@@ -90,6 +92,7 @@ python scripts/train_tabpfn_v1_baseline.py \
   --max-num-classes 10 \
   --warmup-steps 1000 \
   --lr-min-ratio 0.1 \
+  --amp-dtype bf16 \
   --out-dir results/synthetic_v2 \
   --run-name tabpfn_v1_baseline_scmcomplex_d256_l8_ctx512_cols64_1M_${SLURM_JOB_ID}
 
