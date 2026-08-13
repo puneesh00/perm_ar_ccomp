@@ -45,8 +45,23 @@ def build_xy(full: FullSyntheticTable, task, n_context: int, n_query: int):
     """
     task: CompletionTask from TargetPredictionSampler.sample -- row_idx is
     context rows first (0..n_context-1), query rows after.
-    Returns (x_feat [N, D_feat] float32, y_context [n_context] float32,
-             y_query [n_query] int64).
+
+    Labels are densified to match real TabPFN: each raw class id is remapped
+    to its rank among the UNIQUE values observed in the context rows (see
+    TabPFNV2's _flatten_multiclass_targets), never the raw generator class
+    id. This is what makes a fixed-width nn.Linear(..., max_num_classes)
+    output head correct for a prior that samples class count per table --
+    the head doesn't need to know the realized count, only an upper bound.
+
+    A query row whose true label never appears in the context split can't be
+    predicted correctly by construction (the model never saw that class), so
+    it's mapped to -100 (torch's cross_entropy ignore_index) rather than to
+    a fake/invalid class slot.
+
+    Returns (x_feat [N, D_feat] float32, y_context [n_context] float32
+             (densified), y_query [n_query] int64 (densified, or -100 for
+             context-unseen labels), num_valid_classes int -- number of
+             unique labels observed in this episode's context).
     """
     target_col = task.meta["target_col"]
     feature_cols = [c for c in task.col_idx.tolist() if c != target_col]
@@ -61,10 +76,19 @@ def build_xy(full: FullSyntheticTable, task, n_context: int, n_query: int):
     x_feat = np.stack(parts, axis=1)  # [N, D_feat]
 
     y_all = full.x_cat[rows, target_col].astype(np.int64)
-    y_context = y_all[:n_context].astype(np.float32)
-    y_query = y_all[n_context:]
+    y_context_raw = y_all[:n_context]
+    y_query_raw = y_all[n_context:]
 
-    return x_feat, y_context, y_query
+    unique_context = np.unique(y_context_raw)
+    num_valid_classes = int(unique_context.shape[0])
+    remap = {int(v): i for i, v in enumerate(unique_context.tolist())}
+
+    y_context = np.array([remap[int(v)] for v in y_context_raw], dtype=np.float32)
+    y_query = np.array(
+        [remap.get(int(v), -100) for v in y_query_raw], dtype=np.int64
+    )
+
+    return x_feat, y_context, y_query, num_valid_classes
 
 
 def make_batch(
@@ -77,7 +101,7 @@ def make_batch(
     device: torch.device,
     baselines: bool = False,
 ):
-    x_feats, y_ctxs, y_qrys = [], [], []
+    x_feats, y_ctxs, y_qrys, num_valid_classes_list = [], [], [], []
     baseline_accs = {"logreg": [], "rf": [], "xgb": []}
 
     for _ in range(batch_size):
@@ -85,10 +109,11 @@ def make_batch(
         info = full.table_info()
         task = sampler.sample(info, rng)
 
-        x_feat, y_context, y_query = build_xy(full, task, n_context, n_query)
+        x_feat, y_context, y_query, num_valid_classes = build_xy(full, task, n_context, n_query)
         x_feats.append(x_feat)
         y_ctxs.append(y_context)
         y_qrys.append(y_query)
+        num_valid_classes_list.append(num_valid_classes)
 
         if baselines:
             lr = logreg_context_baseline_acc(full, task)
@@ -104,8 +129,9 @@ def make_batch(
     x_feat_t = torch.as_tensor(np.stack(x_feats), dtype=torch.float32, device=device)
     y_ctx_t = torch.as_tensor(np.stack(y_ctxs), dtype=torch.float32, device=device)
     y_qry_t = torch.as_tensor(np.stack(y_qrys), dtype=torch.long, device=device)
+    num_valid_classes_t = torch.as_tensor(num_valid_classes_list, dtype=torch.long, device=device)
 
-    return x_feat_t, y_ctx_t, y_qry_t, baseline_accs
+    return x_feat_t, y_ctx_t, y_qry_t, num_valid_classes_t, baseline_accs
 
 
 @torch.no_grad()
@@ -118,7 +144,7 @@ def evaluate(model, args, device) -> Dict[str, float]:
             n_cols=args.n_cols,
             p_categorical=args.p_categorical,
             k_max=args.k_max,
-            n_classes=args.n_classes,
+            n_classes=None,
             target_col=args.target_col,
             base_seed=args.eval_seed,
             prior_type=args.tabpfn_prior_type,
@@ -134,11 +160,11 @@ def evaluate(model, args, device) -> Dict[str, float]:
     accs = []
     baseline_accs = {"logreg": [], "rf": [], "xgb": []}
     for _ in range(args.eval_tasks):
-        x_feat_t, y_ctx_t, y_qry_t, b = make_batch(
+        x_feat_t, y_ctx_t, y_qry_t, num_valid_classes_t, b = make_batch(
             eval_gen, eval_sampler, eval_rng, 1, args.eval_n_context, args.eval_n_query, device,
             baselines=True,
         )
-        logits = model(x_feat_t, y_ctx_t, args.eval_n_context)
+        logits = model(x_feat_t, y_ctx_t, args.eval_n_context, num_valid_classes=num_valid_classes_t)
         pred = logits.argmax(dim=-1)
         accs.append((pred == y_qry_t).float().mean().item())
         for k in baseline_accs:
@@ -163,7 +189,12 @@ def parse_args():
     p.add_argument("--target-col", type=int, default=None)
     p.add_argument("--p-categorical", type=float, default=0.3)
     p.add_argument("--k-max", type=int, default=16)
-    p.add_argument("--n-classes", type=int, default=2)
+    p.add_argument(
+        "--max-num-classes", type=int, default=10,
+        help="Fixed output-head width (upper bound on per-table sampled class "
+        "count, matching TabPFNSCMConfig.n_classes_max_max). Not a per-run "
+        "constant class count -- see model_tabpfn_v1.py's TabPFNV1Config docstring.",
+    )
 
     p.add_argument("--n-context", type=int, default=128)
     p.add_argument("--n-query", type=int, default=128)
@@ -211,7 +242,7 @@ def main():
             n_cols=args.n_cols,
             p_categorical=args.p_categorical,
             k_max=args.k_max,
-            n_classes=args.n_classes,
+            n_classes=None,
             target_col=args.target_col,
             base_seed=args.seed,
             prior_type=args.tabpfn_prior_type,
@@ -228,7 +259,7 @@ def main():
         n_heads=args.n_heads,
         mlp_hidden=args.mlp_hidden,
         n_layers=args.n_layers,
-        n_classes=args.n_classes,
+        max_num_classes=args.max_num_classes,
         dropout=args.dropout,
     )
     model = TabPFNV1Model(model_cfg).to(device)
@@ -269,14 +300,16 @@ def main():
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
 
-        x_feat_t, y_ctx_t, y_qry_t, _ = make_batch(
+        x_feat_t, y_ctx_t, y_qry_t, num_valid_classes_t, _ = make_batch(
             table_generator, sampler, np_rng, args.batch_tasks, args.n_context, args.n_query, device,
             baselines=False,
         )
-        logits = model(x_feat_t, y_ctx_t, args.n_context)  # [B, n_query, n_classes]
+        logits = model(
+            x_feat_t, y_ctx_t, args.n_context, num_valid_classes=num_valid_classes_t
+        )  # [B, n_query, max_num_classes]
 
         loss = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, args.n_classes), y_qry_t.reshape(-1)
+            logits.reshape(-1, args.max_num_classes), y_qry_t.reshape(-1), ignore_index=-100
         )
         loss.backward()
 

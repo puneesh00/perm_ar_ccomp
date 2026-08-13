@@ -43,6 +43,7 @@ per-cell addressability for arbitrary completion), which is exactly the
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -55,7 +56,15 @@ class TabPFNV1Config:
     n_heads: int = 4
     mlp_hidden: int = 512
     n_layers: int = 6
-    n_classes: int = 2
+    # Fixed output-head width, set once at construction -- NOT a per-table
+    # class count. Real TabPFN densifies labels to the rank of each value
+    # among the UNIQUE labels observed in that episode's context/training
+    # rows (see train_tabpfn_v1_baseline.build_xy), so a fixed-size head
+    # can still cover episodes with any realized class count up to this
+    # ceiling. A plain fixed n_classes (the previous default, no
+    # densification) is a real train/eval mismatch against a prior that
+    # samples class count per table.
+    max_num_classes: int = 10
     dropout: float = 0.0
 
 
@@ -127,15 +136,28 @@ class TabPFNV1Model(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(cfg.d_model, cfg.mlp_hidden),
             nn.GELU(),
-            nn.Linear(cfg.mlp_hidden, cfg.n_classes),
+            nn.Linear(cfg.mlp_hidden, cfg.max_num_classes),
         )
 
-    def forward(self, x_feat: torch.Tensor, y_context: torch.Tensor, n_context: int) -> torch.Tensor:
+    def forward(
+        self,
+        x_feat: torch.Tensor,
+        y_context: torch.Tensor,
+        n_context: int,
+        num_valid_classes: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         x_feat: [B, N, D_feat] float, all rows' feature columns, context rows
             first (rows 0..n_context-1), query rows after.
-        y_context: [B, n_context] float, context rows' true target class id.
-        Returns logits [B, N - n_context, n_classes] for the query rows.
+        y_context: [B, n_context] float, context rows' DENSIFIED target class
+            id -- rank of each row's true label among that episode's unique
+            context labels (see build_xy), not the raw generator class id.
+        num_valid_classes: optional [B] long, number of unique context
+            labels per episode. When given, output logits at index >= this
+            (never a valid densified label for that episode) are masked to
+            -inf, matching TypedCategoricalHead's cardinality masking
+            elsewhere in this codebase.
+        Returns logits [B, N - n_context, max_num_classes] for the query rows.
         """
         x = self.feature_encoder(x_feat, n_context)
         y = self.target_encoder(y_context, x.shape[1])
@@ -143,4 +165,11 @@ class TabPFNV1Model(nn.Module):
         for layer in self.layers:
             src = layer(src, n_context)
         target_repr = src[:, n_context:, -1, :]
-        return self.decoder(target_repr)
+        logits = self.decoder(target_repr)
+
+        if num_valid_classes is not None:
+            k_ids = torch.arange(self.cfg.max_num_classes, device=logits.device).view(1, 1, -1)
+            valid = k_ids < num_valid_classes.to(logits.device).view(-1, 1, 1).clamp(min=1)
+            logits = logits.masked_fill(~valid, float("-inf"))
+
+        return logits
