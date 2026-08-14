@@ -206,8 +206,20 @@ def parse_args():
     p.add_argument("--eval-tasks", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=1000)
 
-    p.add_argument("--steps", type=int, default=40000)
-    p.add_argument("--batch-tasks", type=int, default=8)
+    p.add_argument(
+        "--steps", type=int, default=40000,
+        help="Number of OPTIMIZER steps (post grad-accumulation), not micro-batches. "
+        "warmup/cosine LR schedule, --eval-every, and --checkpoint-every are all in "
+        "these same post-accumulation units.",
+    )
+    p.add_argument("--batch-tasks", type=int, default=8, help="Tables per micro-batch (forward/backward pass).")
+    p.add_argument(
+        "--grad-accum-steps", type=int, default=1,
+        help="Micro-batches accumulated (summed gradients, averaged) before each "
+        "optimizer step. Effective tables per optimizer step = batch_tasks * "
+        "grad_accum_steps. Lets you raise table-diversity-per-update without raising "
+        "peak activation memory (which scales with batch_tasks, not grad_accum_steps).",
+    )
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--checkpoint-every", type=int, default=10000)
 
@@ -294,11 +306,17 @@ def main():
         print("lr_schedule=none (flat lr)")
 
     n_params = sum(p.numel() for p in model.parameters())
+    tables_per_opt_step = args.batch_tasks * args.grad_accum_steps
     print("=== TabPFN-v1-style reference model ===")
     print(f"device={device}")
     print(f"amp_dtype={args.amp_dtype}")
     print(f"params={n_params:,}")
     print(f"run_dir={out_dir}")
+    print(
+        f"batch_tasks={args.batch_tasks} x grad_accum_steps={args.grad_accum_steps} "
+        f"= {tables_per_opt_step} tables/optimizer-step; "
+        f"{args.steps} steps -> {tables_per_opt_step * args.steps:,} tables total"
+    )
 
     metrics_path = out_dir / "metrics.jsonl"
     metrics_file = metrics_path.open("a")
@@ -309,19 +327,31 @@ def main():
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
 
-        x_feat_t, y_ctx_t, y_qry_t, num_valid_classes_t, _ = make_batch(
-            table_generator, sampler, np_rng, args.batch_tasks, args.n_context, args.n_query, device,
-            baselines=False,
-        )
-        with autocast_ctx(args, device):
-            logits = model(
-                x_feat_t, y_ctx_t, args.n_context, num_valid_classes=num_valid_classes_t
-            )  # [B, n_query, max_num_classes]
-
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, args.max_num_classes), y_qry_t.reshape(-1), ignore_index=-100
+        loss_sum = 0.0
+        correct_sum = 0.0
+        total_count = 0
+        for _ in range(args.grad_accum_steps):
+            x_feat_t, y_ctx_t, y_qry_t, num_valid_classes_t, _ = make_batch(
+                table_generator, sampler, np_rng, args.batch_tasks, args.n_context, args.n_query, device,
+                baselines=False,
             )
-        loss.backward()
+            with autocast_ctx(args, device):
+                logits = model(
+                    x_feat_t, y_ctx_t, args.n_context, num_valid_classes=num_valid_classes_t
+                )  # [B, n_query, max_num_classes]
+
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, args.max_num_classes), y_qry_t.reshape(-1), ignore_index=-100
+                )
+            (loss / args.grad_accum_steps).backward()
+
+            loss_sum += loss.item()
+            with torch.no_grad():
+                correct_sum += (logits.argmax(dim=-1) == y_qry_t).float().sum().item()
+                total_count += y_qry_t.numel()
+
+        avg_loss = loss_sum / args.grad_accum_steps
+        cat_acc = correct_sum / total_count
 
         if args.grad_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -333,30 +363,31 @@ def main():
             scheduler.step()
 
         if step % args.log_every == 0 or step == 1:
-            with torch.no_grad():
-                cat_acc = (logits.argmax(dim=-1) == y_qry_t).float().mean().item()
             lr_now = optimizer.param_groups[0]["lr"]
             elapsed = time.time() - start_time
             steps_per_sec = step / elapsed if elapsed > 0 else 0.0
             print(
-                f"[step {step:06d}] loss={loss.item():.4f} lr={lr_now:.2e} "
+                f"[step {step:06d}] loss={avg_loss:.4f} lr={lr_now:.2e} "
                 f"train_cat_acc={cat_acc:.4f} steps/s={steps_per_sec:.2f}"
             )
             metrics_file.write(json.dumps({
-                "step": step, "split": "train", "loss": loss.item(),
+                "step": step, "split": "train", "loss": avg_loss,
                 "train/cat_acc": cat_acc, "lr": lr_now, "grad_norm": float(grad_norm),
             }) + "\n")
             metrics_file.flush()
 
         if step % args.eval_every == 0 or step == args.steps:
             eval_metrics = evaluate(model, args, device)
-            ckpt_path = out_dir / f"checkpoint_step_{step}.pt"
-            torch.save({"model": model.state_dict(), "step": step, "args": vars(args)}, ckpt_path)
-            print(f"[eval step {step:06d}] saved {ckpt_path}")
+            print(f"[eval step {step:06d}]")
             for key, value in sorted(eval_metrics.items()):
                 print(f"  {key}: {value:.4f}")
             metrics_file.write(json.dumps({"step": step, "split": "eval", **eval_metrics}) + "\n")
             metrics_file.flush()
+
+        if step % args.checkpoint_every == 0 or step == args.steps:
+            ckpt_path = out_dir / f"checkpoint_step_{step}.pt"
+            torch.save({"model": model.state_dict(), "step": step, "args": vars(args)}, ckpt_path)
+            print(f"[checkpoint step {step:06d}] saved {ckpt_path}")
 
     metrics_file.close()
     print(f"Done. Results in: {out_dir}")

@@ -548,7 +548,7 @@ def rf_context_baseline_acc(
     if len(np.unique(y_ctx)) < 2:
         pred = np.full_like(y_qry, y_ctx[0])
     else:
-        clf = RandomForestClassifier(n_estimators=200, max_depth=None, n_jobs=-1, random_state=0)
+        clf = RandomForestClassifier(n_estimators=200, max_depth=None, n_jobs=1, random_state=0)
         clf.fit(X_ctx, y_ctx)
         pred = clf.predict(X_qry)
 
@@ -583,7 +583,7 @@ def xgb_context_baseline_acc(
             n_estimators=200,
             max_depth=6,
             learning_rate=0.1,
-            n_jobs=-1,
+            n_jobs=1,
             verbosity=0,
             random_state=0,
         )
