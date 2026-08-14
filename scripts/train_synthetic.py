@@ -1085,6 +1085,24 @@ def parse_args():
             "back.",
         ),
     )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help=(
+            "Accumulate gradients over this many micro-batches (each of "
+            "--batch-tasks episodes) before calling optimizer.step(), instead "
+            "of stepping every micro-batch. Exact (not approximate) for this "
+            "model family: nothing here uses batch-dependent normalization "
+            "(no BatchNorm, only LayerNorm), so N accumulated micro-batches "
+            "of size B produce the identical gradient a single true batch of "
+            "size N*B would -- this is purely a memory-vs-wall-clock trade "
+            "for fitting a larger effective batch (more supervised signal "
+            "per optimizer step) on a card too small for that batch size "
+            "directly. --steps/--warmup-steps count optimizer steps (the "
+            "outer loop), not micro-batches.",
+        ),
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -1396,80 +1414,57 @@ def main() -> None:
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
 
+        # task_losses holds one entry per micro-batch (grad_accum_steps of
+        # them), each already the batch_tasks-averaged loss for that
+        # micro-batch -- NOT scaled by grad_accum_steps, so `loss` below
+        # (its mean) stays comparable in magnitude to a non-accumulated run.
+        # Scaling and .backward() happen per micro-batch, immediately, so
+        # each micro-batch's activations are freed before the next one is
+        # built -- accumulating in .grad, not by keeping every micro-batch's
+        # graph alive to backward() once at the end (that would defeat the
+        # whole memory point of accumulation).
         task_losses: list[torch.Tensor] = []
         task_metric_rows: list[Dict[str, float]] = []
         task_names: list[str] = []
         plan_modes: list[str] = []
 
-        if args.batched_forward:
-            # Sample all B episodes first, then one real [B, N, D] forward
-            # pass instead of B sequential B=1 passes -- see
-            # compute_task_loss_onepass_batched's docstring for why this is
-            # equivalent gradient math, just much better GPU utilization.
-            full_batch = []
-            task_batch = []
-            plan_batch = []
-            for _ in range(args.batch_tasks):
-                if args.data_mode == "fixed_table":
-                    assert full_fixed is not None
-                    full = full_fixed
+        for _accum_step in range(args.grad_accum_steps):
+            if args.batched_forward:
+                # Sample all B episodes first, then one real [B, N, D] forward
+                # pass instead of B sequential B=1 passes -- see
+                # compute_task_loss_onepass_batched's docstring for why this is
+                # equivalent gradient math, just much better GPU utilization.
+                full_batch = []
+                task_batch = []
+                plan_batch = []
+                for _ in range(args.batch_tasks):
+                    if args.data_mode == "fixed_table":
+                        assert full_fixed is not None
+                        full = full_fixed
+                    else:
+                        assert table_generator is not None
+                        full = table_generator.sample_table()
+
+                    info = full.table_info()
+                    task = sampler.sample(info, np_rng)
+                    plan = factorizer.build(task, np_rng)
+
+                    full_batch.append(full)
+                    task_batch.append(task)
+                    plan_batch.append(plan)
+
+                if args.architecture == "single_stream":
+                    batched_loss_fn = compute_task_loss_single_stream_batched
+                elif args.architecture == "two_stream_ar_sparse":
+                    batched_loss_fn = compute_task_loss_onepass_batched_sparse
                 else:
-                    assert table_generator is not None
-                    full = table_generator.sample_table()
-
-                info = full.table_info()
-                task = sampler.sample(info, np_rng)
-                plan = factorizer.build(task, np_rng)
-
-                full_batch.append(full)
-                task_batch.append(task)
-                plan_batch.append(plan)
-
-            if args.architecture == "single_stream":
-                batched_loss_fn = compute_task_loss_single_stream_batched
-            elif args.architecture == "two_stream_ar_sparse":
-                batched_loss_fn = compute_task_loss_onepass_batched_sparse
-            else:
-                batched_loss_fn = compute_task_loss_onepass_batched
-            with autocast_ctx(args, device):
-                loss_out = batched_loss_fn(
-                    model=model,
-                    full_list=full_batch,
-                    task_list=task_batch,
-                    plan_list=plan_batch,
-                    device=device,
-                    num_weight=args.num_weight,
-                    cat_weight=args.cat_weight,
-                    **sparse_partial_predict_kwargs(args, np_rng),
-                )
-
-            task_losses = [loss_out.loss]
-            task_metric_rows = [loss_out.metrics]
-            task_names = [task_batch[0].task_name]
-            plan_modes = [plan_batch[0].mode]
-
-            loss = loss_out.loss
-            loss.backward()
-        else:
-            for _ in range(args.batch_tasks):
-                if args.data_mode == "fixed_table":
-                    assert full_fixed is not None
-                    full = full_fixed
-                else:
-                    assert table_generator is not None
-                    full = table_generator.sample_table()
-
-                info = full.table_info()
-
-                task = sampler.sample(info, np_rng)
-                plan = factorizer.build(task, np_rng)
-
+                    batched_loss_fn = compute_task_loss_onepass_batched
                 with autocast_ctx(args, device):
-                    loss_out = loss_fn(
+                    loss_out = batched_loss_fn(
                         model=model,
-                        full=full,
-                        task=task,
-                        plan=plan,
+                        full_list=full_batch,
+                        task_list=task_batch,
+                        plan_list=plan_batch,
                         device=device,
                         num_weight=args.num_weight,
                         cat_weight=args.cat_weight,
@@ -1478,11 +1473,47 @@ def main() -> None:
 
                 task_losses.append(loss_out.loss)
                 task_metric_rows.append(loss_out.metrics)
-                task_names.append(task.task_name)
-                plan_modes.append(plan.mode)
+                task_names.append(task_batch[0].task_name)
+                plan_modes.append(plan_batch[0].mode)
 
-            loss = torch.stack(task_losses).mean()
-            loss.backward()
+                (loss_out.loss / args.grad_accum_steps).backward()
+            else:
+                micro_task_losses: list[torch.Tensor] = []
+                for _ in range(args.batch_tasks):
+                    if args.data_mode == "fixed_table":
+                        assert full_fixed is not None
+                        full = full_fixed
+                    else:
+                        assert table_generator is not None
+                        full = table_generator.sample_table()
+
+                    info = full.table_info()
+
+                    task = sampler.sample(info, np_rng)
+                    plan = factorizer.build(task, np_rng)
+
+                    with autocast_ctx(args, device):
+                        loss_out = loss_fn(
+                            model=model,
+                            full=full,
+                            task=task,
+                            plan=plan,
+                            device=device,
+                            num_weight=args.num_weight,
+                            cat_weight=args.cat_weight,
+                            **sparse_partial_predict_kwargs(args, np_rng),
+                        )
+
+                    micro_task_losses.append(loss_out.loss)
+                    task_metric_rows.append(loss_out.metrics)
+                    task_names.append(task.task_name)
+                    plan_modes.append(plan.mode)
+
+                micro_loss = torch.stack(micro_task_losses).mean()
+                task_losses.append(micro_loss)
+                (micro_loss / args.grad_accum_steps).backward()
+
+        loss = torch.stack(task_losses).mean()
 
         if args.grad_clip is not None and args.grad_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(
