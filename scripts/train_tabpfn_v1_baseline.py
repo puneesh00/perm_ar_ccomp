@@ -327,8 +327,8 @@ def main():
     for step in range(1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
 
-        loss_sum = 0.0
-        correct_sum = 0.0
+        loss_sum_t = torch.zeros((), device=device)
+        correct_sum_t = torch.zeros((), device=device)
         total_count = 0
         for _ in range(args.grad_accum_steps):
             x_feat_t, y_ctx_t, y_qry_t, num_valid_classes_t, _ = make_batch(
@@ -345,13 +345,16 @@ def main():
                 )
             (loss / args.grad_accum_steps).backward()
 
-            loss_sum += loss.item()
+            # Stay on-device here (no .item()/.cpu()) -- syncing every
+            # micro-batch would block the CPU on outstanding GPU work each
+            # time, serializing what should be an overlapped/pipelined
+            # accumulation loop. Only materialize to Python floats below,
+            # gated behind the same log_every check the pre-accumulation
+            # code used (so most steps still never sync early).
+            loss_sum_t += loss.detach()
             with torch.no_grad():
-                correct_sum += (logits.argmax(dim=-1) == y_qry_t).float().sum().item()
+                correct_sum_t += (logits.argmax(dim=-1) == y_qry_t).float().sum()
                 total_count += y_qry_t.numel()
-
-        avg_loss = loss_sum / args.grad_accum_steps
-        cat_acc = correct_sum / total_count
 
         if args.grad_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -363,6 +366,8 @@ def main():
             scheduler.step()
 
         if step % args.log_every == 0 or step == 1:
+            avg_loss = (loss_sum_t / args.grad_accum_steps).item()
+            cat_acc = (correct_sum_t / total_count).item()
             lr_now = optimizer.param_groups[0]["lr"]
             elapsed = time.time() - start_time
             steps_per_sec = step / elapsed if elapsed > 0 else 0.0

@@ -32,6 +32,7 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
     r2_score,
+    roc_auc_score,
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
@@ -82,26 +83,48 @@ def get_suite_task_ids(suite_name: str) -> List[int]:
 # ---------------------------------------------------------------------
 
 
-def load_openml_task(task_id: int):
-    task = openml.tasks.get_task(task_id)
+def load_openml_task(task_id: int, max_retries: int = 4, backoff_sec: float = 5.0):
+    """
+    openml.org occasionally returns transient errors (e.g. 503s under load).
+    Retry with exponential backoff before giving up on this task.
+    """
+    last_err: Optional[Exception] = None
 
-    # This works for most modern openml-python versions.
-    try:
-        X, y = task.get_X_and_y(dataset_format="dataframe")
-    except Exception:
-        dataset = task.get_dataset()
-        target_name = task.target_name
-        X, y, _, _ = dataset.get_data(
-            target=target_name,
-            dataset_format="dataframe",
-        )
+    for attempt in range(max_retries):
+        try:
+            task = openml.tasks.get_task(task_id)
 
-    if not isinstance(X, pd.DataFrame):
-        X = pd.DataFrame(X)
+            # This works for most modern openml-python versions.
+            try:
+                X, y = task.get_X_and_y(dataset_format="dataframe")
+            except Exception:
+                dataset = task.get_dataset()
+                target_name = task.target_name
+                X, y, _, _ = dataset.get_data(
+                    target=target_name,
+                    dataset_format="dataframe",
+                )
 
-    y = pd.Series(y)
+            if not isinstance(X, pd.DataFrame):
+                X = pd.DataFrame(X)
 
-    return task, X, y
+            y = pd.Series(y)
+
+            return task, X, y
+
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                sleep_sec = backoff_sec * (2 ** attempt)
+                print(
+                    f"[warn] task={task_id}: load failed on attempt "
+                    f"{attempt + 1}/{max_retries} ({e!r}); "
+                    f"retrying in {sleep_sec:.0f}s."
+                )
+                time.sleep(sleep_sec)
+
+    assert last_err is not None
+    raise last_err
 
 
 def get_split_indices(task, repeat: int, fold: int, sample: int):
@@ -204,6 +227,7 @@ def build_classification_models(
     seed: int,
     n_jobs: int,
     model_names: Iterable[str],
+    n_classes: int,
 ) -> Dict[str, Any]:
     models: Dict[str, Any] = {}
 
@@ -242,18 +266,26 @@ def build_classification_models(
         else:
             from xgboost import XGBClassifier
 
+            if n_classes == 2:
+                xgb_kwargs = dict(objective="binary:logistic", eval_metric="logloss")
+            else:
+                xgb_kwargs = dict(
+                    objective="multi:softprob",
+                    eval_metric="mlogloss",
+                    num_class=n_classes,
+                )
+
             models["xgb"] = XGBClassifier(
                 n_estimators=300,
                 max_depth=6,
                 learning_rate=0.05,
                 subsample=0.9,
                 colsample_bytree=0.9,
-                objective="multi:softprob",
-                eval_metric="mlogloss",
                 tree_method="hist",
                 device="cpu",
                 n_jobs=n_jobs,
                 random_state=seed,
+                **xgb_kwargs,
             )
 
     if "lgbm" in requested:
@@ -401,8 +433,29 @@ def classification_metrics(y_true, y_pred, y_proba=None) -> Dict[str, float]:
             out["log_loss"] = float(log_loss(y_true, y_proba))
         except Exception:
             out["log_loss"] = float("nan")
+
+        try:
+            n_classes = y_proba.shape[1]
+            labels = np.arange(n_classes)
+            if n_classes == 2:
+                out["roc_auc"] = float(
+                    roc_auc_score(y_true, y_proba[:, 1], labels=labels)
+                )
+            else:
+                out["roc_auc"] = float(
+                    roc_auc_score(
+                        y_true,
+                        y_proba,
+                        multi_class="ovo",
+                        average="macro",
+                        labels=labels,
+                    )
+                )
+        except Exception:
+            out["roc_auc"] = float("nan")
     else:
         out["log_loss"] = float("nan")
+        out["roc_auc"] = float("nan")
 
     return out
 
@@ -494,7 +547,7 @@ def run_task_classification(
     y_test = y[test_idx]
 
     preprocessor = make_tree_preprocessor(X_train)
-    models = build_classification_models(args.seed, args.n_jobs, args.models.split(","))
+    models = build_classification_models(args.seed, args.n_jobs, args.models.split(","), n_classes)
 
     print(
         f"[classification] task={task_id} name={task_name} "
@@ -724,10 +777,27 @@ def main():
     for idx, task_id in enumerate(task_ids):
         print(f"\n=== [{idx + 1}/{len(task_ids)}] task_id={task_id} ===")
 
-        if suite_type == "classification":
-            run_task_classification(task_id, args, logger)
-        else:
-            run_task_regression(task_id, args, logger)
+        try:
+            if suite_type == "classification":
+                run_task_classification(task_id, args, logger)
+            else:
+                run_task_regression(task_id, args, logger)
+        except Exception as e:
+            # A single flaky/unavailable task (e.g. an openml.org outage)
+            # should not take down the rest of the suite run.
+            print(f"[error] task={task_id}: failed to load/run task: {e}")
+            logger.log(
+                {
+                    "suite": args.suite,
+                    "task_id": task_id,
+                    "task_name": str(task_id),
+                    "task_type": suite_type,
+                    "model": None,
+                    "status": "error",
+                    "error": repr(e),
+                    "traceback": traceback.format_exc(),
+                }
+            )
 
         # Update CSV after every task for convenience.
         write_csv_from_jsonl(jsonl_path, csv_path)

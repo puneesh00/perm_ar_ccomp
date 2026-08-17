@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Union
 
 import torch
 import torch.nn.functional as F
@@ -20,7 +20,11 @@ from tab_completion.model import (
 @dataclass
 class LossOutput:
     loss: torch.Tensor
-    metrics: Dict[str, float]
+    # Values are detached GPU tensors (0.0/0 sentinels on the empty-cell-type
+    # branches), not eagerly synced Python scalars -- see typed_mse_ce_loss.
+    # Callers convert with float()/int() themselves, at whatever cadence they
+    # actually need a host-side value.
+    metrics: Dict[str, Union[torch.Tensor, float, int]]
 
 
 def typed_mse_ce_loss(
@@ -55,9 +59,17 @@ def typed_mse_ce_loss(
         num_loss = F.mse_loss(mu, y_num)
         losses.append(num_weight * num_loss)
 
-        metrics["loss_num"] = float(num_loss.detach().cpu())
-        metrics["num_mse"] = float(num_loss.detach().cpu())
-        metrics["num_cells"] = int(num_query.sum().detach().cpu())
+        # Stay on-device (no .cpu()/float()/int()) -- this runs once per
+        # micro-batch, and under grad accumulation that can be dozens of
+        # times per optimizer step. Forcing a host sync here every call
+        # serializes the accumulation loop instead of letting CUDA overlap
+        # consecutive micro-batches. Callers that need Python scalars
+        # (logging, eval) already convert with float()/int() themselves,
+        # typically already gated behind a log/eval-interval check -- so the
+        # sync now happens there instead, at the same reduced frequency.
+        metrics["loss_num"] = num_loss.detach()
+        metrics["num_mse"] = num_loss.detach()
+        metrics["num_cells"] = num_query.sum().detach()
     else:
         metrics["loss_num"] = 0.0
         metrics["num_mse"] = 0.0
@@ -74,9 +86,9 @@ def typed_mse_ce_loss(
             pred_class = logits.argmax(dim=-1)
             acc = (pred_class == targets).float().mean()
 
-        metrics["loss_cat"] = float(cat_loss.detach().cpu())
-        metrics["cat_acc"] = float(acc.detach().cpu())
-        metrics["cat_cells"] = int(cat_query.sum().detach().cpu())
+        metrics["loss_cat"] = cat_loss.detach()
+        metrics["cat_acc"] = acc.detach()
+        metrics["cat_cells"] = cat_query.sum().detach()
     else:
         metrics["loss_cat"] = 0.0
         metrics["cat_acc"] = 0.0
@@ -86,7 +98,7 @@ def typed_mse_ce_loss(
         raise ValueError("No queried numerical or categorical cells found.")
 
     loss = sum(losses)
-    metrics["loss_total"] = float(loss.detach().cpu())
-    metrics["query_cells"] = int(query_mask.sum().detach().cpu())
+    metrics["loss_total"] = loss.detach()
+    metrics["query_cells"] = query_mask.sum().detach()
 
     return LossOutput(loss=loss, metrics=metrics)
