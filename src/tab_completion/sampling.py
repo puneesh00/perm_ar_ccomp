@@ -594,6 +594,70 @@ class RowBlockSampler:
 
 
 @dataclass
+class CellBlockSampler:
+    """
+    Context rows are fully observed (same C/Q guarantee as ColumnBlockSampler
+    and RowBlockSampler). Query rows have an independently-per-episode-sampled
+    fraction of their OWN cells queried, chosen uniformly over cell positions
+    within the query-row block only -- unlike RandomCellSampler (no context
+    guarantee at all: every row, context or not, can be partially corrupted),
+    and unlike ColumnBlockSampler (same k columns held out for every query
+    row). Here different query rows can have different columns queried --
+    irregular, per-row missingness, but still with guaranteed clean
+    demonstration rows in context.
+    """
+    n_context: int
+    n_query: int
+    min_query_frac: float = 0.05
+    max_query_frac: float = 0.15
+    min_query_cells: int = 1
+    replace_rows: bool = False
+    conditioning_mode: str = "inductive_rows"
+    task_name: str = "cell_block"
+
+    def sample_sparse(self, info: TableInfo, rng: np.random.Generator) -> SparseCompletionTask:
+        if not (0.0 < self.min_query_frac <= self.max_query_frac < 1.0):
+            raise ValueError("require 0 < min_query_frac <= max_query_frac < 1.")
+
+        n_ep = self.n_context + self.n_query
+        row_idx = sample_unique_rows_fast(rng, info.n_rows, n_ep, self.replace_rows)
+        col_idx = all_columns(info)
+
+        d_ep = info.n_cols
+        total_query_cells = self.n_query * d_ep
+
+        frac = rng.uniform(self.min_query_frac, self.max_query_frac)
+        k = max(int(round(frac * total_query_cells)), self.min_query_cells)
+        k = min(k, total_query_cells)
+
+        flat = rng.choice(total_query_cells, size=k, replace=False)
+        local_coords = flat_indices_to_coords(flat, d_ep)  # rows local to the query block, 0..n_query-1
+        query_coords = local_coords.copy()
+        query_coords[:, 0] += self.n_context  # offset into full-episode row indices
+
+        return SparseCompletionTask(
+            row_idx=row_idx,
+            col_idx=col_idx,
+            query_coords=query_coords,
+            observed_mode="all_except_query",
+            task_name=self.task_name,
+            meta={
+                "query_frac": float(frac),
+                "num_query_cells_requested": int(k),
+                "n_context": self.n_context,
+                "n_query": self.n_query,
+                "conditioning_mode": self.conditioning_mode,
+                "context_rows_local": np.arange(self.n_context, dtype=np.int64),
+                "query_rows_local": np.arange(self.n_context, n_ep, dtype=np.int64),
+                "sparse": True,
+            },
+        )
+
+    def sample(self, info: TableInfo, rng: np.random.Generator) -> CompletionTask:
+        return self.sample_sparse(info, rng).to_dense_task()
+
+
+@dataclass
 class LabelFeatureSampler:
     """
     Query target column plus sampled feature columns for query rows.

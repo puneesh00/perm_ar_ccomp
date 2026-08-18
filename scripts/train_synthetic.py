@@ -34,6 +34,7 @@ from tab_completion.sampling import (
     RandomCellSampler,
     ColumnBlockSampler,
     RowBlockSampler,
+    CellBlockSampler,
     LabelFeatureSampler,
     MixtureSampler,
 )
@@ -140,6 +141,15 @@ def build_sampler(args) -> object:
             conditioning_mode=args.label_feature_conditioning_mode,
         )
 
+    if args.sampler == "cell_block":
+        return CellBlockSampler(
+            n_context=args.n_context,
+            n_query=args.n_query,
+            min_query_frac=args.cell_block_min_frac,
+            max_query_frac=args.cell_block_max_frac,
+            conditioning_mode=args.cell_block_conditioning_mode,
+        )
+
     if args.sampler == "mixture":
         return MixtureSampler(
             samplers=[
@@ -168,12 +178,20 @@ def build_sampler(args) -> object:
                     target_col=args.target_col,
                     conditioning_mode=args.label_feature_conditioning_mode,
                 ),
+                CellBlockSampler(
+                    n_context=args.n_context,
+                    n_query=args.n_query,
+                    min_query_frac=args.cell_block_min_frac,
+                    max_query_frac=args.cell_block_max_frac,
+                    conditioning_mode=args.cell_block_conditioning_mode,
+                ),
             ],
             weights=[
                 args.mix_target,
                 args.mix_random_cell,
                 args.mix_column_block,
                 args.mix_label_feature,
+                args.mix_cell_block,
             ],
         )
 
@@ -341,10 +359,10 @@ def _eval_override(args, name: str, fallback):
 def _parse_eval_sampler_names(eval_samplers: str) -> list[str]:
     """Parse comma-separated eval sampler names."""
     if eval_samplers == "all":
-        return ["target", "random_cell", "column_block", "row_block", "label_feature"]
+        return ["target", "random_cell", "column_block", "row_block", "label_feature", "cell_block"]
 
     names = [x.strip() for x in eval_samplers.split(",") if x.strip()]
-    allowed = {"target", "random_cell", "column_block", "row_block", "label_feature"}
+    allowed = {"target", "random_cell", "column_block", "row_block", "label_feature", "cell_block"}
     unknown = [x for x in names if x not in allowed]
     if unknown:
         raise ValueError(
@@ -413,6 +431,18 @@ def build_eval_samplers(args) -> Dict[str, object]:
         args.label_feature_conditioning_mode,
     )
 
+    cell_block_n_context = _eval_override(args, "eval_cell_block_n_context", args.n_context)
+    cell_block_n_query = _eval_override(args, "eval_cell_block_n_query", args.n_query)
+    cell_block_min_frac = _eval_override(
+        args, "eval_cell_block_min_frac", args.cell_block_min_frac
+    )
+    cell_block_max_frac = _eval_override(
+        args, "eval_cell_block_max_frac", args.cell_block_max_frac
+    )
+    cell_block_conditioning_mode = _eval_override(
+        args, "eval_cell_block_conditioning_mode", args.cell_block_conditioning_mode
+    )
+
     registry = {
         "target": TargetPredictionSampler(
             n_context=target_n_context,
@@ -444,6 +474,13 @@ def build_eval_samplers(args) -> Dict[str, object]:
             n_feature_cols=label_feature_n_feature_cols,
             target_col=args.target_col,
             conditioning_mode=label_feature_conditioning_mode,
+        ),
+        "cell_block": CellBlockSampler(
+            n_context=cell_block_n_context,
+            n_query=cell_block_n_query,
+            min_query_frac=cell_block_min_frac,
+            max_query_frac=cell_block_max_frac,
+            conditioning_mode=cell_block_conditioning_mode,
         ),
     }
 
@@ -633,7 +670,10 @@ def evaluate(
                     n_cols=args.n_cols,
                     p_categorical=args.p_categorical,
                     k_max=args.k_max,
-                    n_classes=args.n_classes,
+                    # This generator has no per-table class-count sampler
+                    # (unlike TabPFNSCMConfig) -- None falls back to fixed
+                    # binary rather than crashing on a non-int field.
+                    n_classes=args.n_classes if args.n_classes is not None else 2,
                     target_col=args.target_col,
                     latent_dim=args.latent_dim,
                     noise=args.data_noise,
@@ -788,7 +828,16 @@ def parse_args():
     parser.add_argument("--n-cols", type=int, default=32)
     parser.add_argument("--p-categorical", type=float, default=0.3)
     parser.add_argument("--k-max", type=int, default=16)
-    parser.add_argument("--n-classes", type=int, default=2)
+    parser.add_argument(
+        "--n-classes", type=int, default=None,
+        help="Fixed target-column class count. Default None: for --data-prior "
+             "tabpfn, this enables TabPFNSCMConfig's real per-table class-count "
+             "sampler (2-10, binary-heavy, matching TabPFN's own training "
+             "config) instead of forcing every table to exactly this many "
+             "classes -- pass an explicit int only for a deliberate "
+             "fixed-cardinality ablation. The non-tabpfn synthetic generator "
+             "doesn't support per-table sampling; None there falls back to 2.",
+    )
     parser.add_argument("--target-col", type=int, default=None)
     parser.add_argument("--data-seed", type=int, default=123)
     parser.add_argument("--latent-dim", type=int, default=8)
@@ -855,6 +904,7 @@ def parse_args():
             "column_block",
             "row_block",
             "label_feature",
+            "cell_block",
             "mixture",
         ],
     )
@@ -891,12 +941,32 @@ def parse_args():
         default="inductive_rows",
         choices=["inductive_rows", "transductive"],
     )
+    parser.add_argument(
+        "--cell-block-min-frac",
+        type=float,
+        default=0.05,
+        help="cell_block sampler: lower bound of the per-episode uniformly "
+             "sampled fraction of query-row cells that get queried.",
+    )
+    parser.add_argument(
+        "--cell-block-max-frac",
+        type=float,
+        default=0.15,
+        help="cell_block sampler: upper bound of that per-episode fraction.",
+    )
+    parser.add_argument(
+        "--cell-block-conditioning-mode",
+        type=str,
+        default="inductive_rows",
+        choices=["inductive_rows", "transductive"],
+    )
 
     # Mixture weights
     parser.add_argument("--mix-target", type=float, default=0.25)
     parser.add_argument("--mix-random-cell", type=float, default=0.25)
     parser.add_argument("--mix-column-block", type=float, default=0.25)
     parser.add_argument("--mix-label-feature", type=float, default=0.25)
+    parser.add_argument("--mix-cell-block", type=float, default=0.0)
 
     # Factorization
     parser.add_argument(
@@ -1197,6 +1267,16 @@ def parse_args():
         default=None,
         choices=["inductive_rows", "transductive"],
     )
+    parser.add_argument("--eval-cell-block-n-context", type=int, default=None)
+    parser.add_argument("--eval-cell-block-n-query", type=int, default=None)
+    parser.add_argument("--eval-cell-block-min-frac", type=float, default=None)
+    parser.add_argument("--eval-cell-block-max-frac", type=float, default=None)
+    parser.add_argument(
+        "--eval-cell-block-conditioning-mode",
+        type=str,
+        default=None,
+        choices=["inductive_rows", "transductive"],
+    )
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--out-dir", type=str, default="results/synthetic_v0")
     parser.add_argument("--run-name", type=str, default=None)
@@ -1263,7 +1343,7 @@ def main() -> None:
             n_cols=args.n_cols,
             p_categorical=args.p_categorical,
             k_max=args.k_max,
-            n_classes=args.n_classes,
+            n_classes=args.n_classes if args.n_classes is not None else 2,
             seed=args.data_seed,
             target_col=args.target_col,
             latent_dim=args.latent_dim,
@@ -1303,7 +1383,7 @@ def main() -> None:
                     n_cols=args.n_cols,
                     p_categorical=args.p_categorical,
                     k_max=args.k_max,
-                    n_classes=args.n_classes,
+                    n_classes=args.n_classes if args.n_classes is not None else 2,
                     target_col=args.target_col,
                     latent_dim=args.latent_dim,
                     noise=args.data_noise,
