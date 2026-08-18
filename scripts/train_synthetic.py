@@ -1280,6 +1280,15 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--out-dir", type=str, default="results/synthetic_v0")
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help=(
+            "Path to a checkpoint .pt saved by this script. Restores model "
+            "and optimizer state and continues training from checkpoint['step'] "
+            "+ 1 up to --steps (which must match the original run's total "
+            "step count for the LR schedule to line up)."
+        ),
+    )
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="tab_completion")
 
@@ -1313,6 +1322,17 @@ def main() -> None:
 
     if args.run_name is None:
         args.run_name = f"{args.sampler}_{args.factorization}_{int(time.time())}"
+
+    resume_step = 0
+    if args.resume:
+        resume_step = torch.load(args.resume, map_location="cpu")["step"]
+        # Offset the data/model seeds so the resumed run draws a fresh
+        # stream of synthetic tables instead of replaying, from step 1,
+        # the exact sequence the original run already trained on (both
+        # table_generator and np_rng/torch RNG are seeded deterministically
+        # from these).
+        args.seed += resume_step
+        args.data_seed += resume_step
 
     torch.manual_seed(args.seed)
     np_rng = np.random.default_rng(args.seed)
@@ -1475,6 +1495,18 @@ def main() -> None:
     else:
         print("lr_schedule=none (flat lr)")
 
+    start_step = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_step = ckpt["step"]
+        assert start_step == resume_step
+        if scheduler is not None:
+            for _ in range(start_step):
+                scheduler.step()
+        print(f"resumed from {args.resume} at step={start_step} (seed={args.seed}, data_seed={args.data_seed})")
+
     n_params = sum(p.numel() for p in model.parameters())
 
     print(f"architecture={args.architecture}")
@@ -1491,7 +1523,7 @@ def main() -> None:
     start_time = time.time()
     last_log_time = time.time()
 
-    for step in range(1, args.steps + 1):
+    for step in range(start_step + 1, args.steps + 1):
         optimizer.zero_grad(set_to_none=True)
 
         # task_losses holds one entry per micro-batch (grad_accum_steps of
@@ -1679,19 +1711,20 @@ def main() -> None:
 
             log_metrics(logger, wandb_run, row)
 
-            ckpt_path = out_dir / f"checkpoint_step_{step}.pt"
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                    "args": vars(args),
-                    "model_cfg": model_cfg.__dict__,
-                },
-                ckpt_path,
-            )
+            if args.checkpoint_every > 0 and (step % args.checkpoint_every == 0 or step == args.steps):
+                ckpt_path = out_dir / f"checkpoint_step_{step}.pt"
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "step": step,
+                        "args": vars(args),
+                        "model_cfg": model_cfg.__dict__,
+                    },
+                    ckpt_path,
+                )
 
-            print(f"[eval step {step:06d}] saved {ckpt_path}")
+                print(f"[eval step {step:06d}] saved {ckpt_path}")
 
             # Print compact eval summary.
             for key, value in sorted(eval_metrics.items()):
