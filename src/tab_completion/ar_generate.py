@@ -67,6 +67,37 @@ from tab_completion.model_perm_ar import (
 )
 
 
+def numeric_context_stats(
+    x_num: np.ndarray, observed_mask: np.ndarray
+) -> tuple:
+    """
+    Per-column (context-only) mean/std, bit-for-bit matching the formula
+    every tokenizer (SingleStreamTokenizer, PermARTokenizer, the sparse
+    equivalent) computes internally for context_normalize: mean/std of the
+    OBSERVED cells in each column, dim=0 here since x_num is [N, D] (no
+    batch dim) vs the model's [B, N, D].
+
+    Needed because context_normalize only transforms the model's INPUT
+    representation -- num_mu (the trained OUTPUT head) is never
+    un-normalized internally, and is trained via plain MSE directly against
+    the raw training target (see typed_mse_ce_loss), which for our
+    synthetic SCM prior is already roughly standardized. Real OpenML numeric
+    columns are NOT roughly standardized (arbitrary real-world units), so
+    num_mu's raw output has to be mapped back with THESE stats -- computed
+    the same way the model itself would -- before it's comparable to a raw
+    real-world target value. See the conversation this was found in:
+    comparing a ~N(0,1)-scale prediction against e.g. blood-transfusion's
+    "Monetary" column (hundreds to thousands of cc) gives a garbage MSE
+    that reflects a units mismatch, not model quality.
+    """
+    observed_f = observed_mask.astype(np.float64)
+    count = np.clip(observed_f.sum(axis=0), 1.0, None)
+    mean = (x_num.astype(np.float64) * observed_f).sum(axis=0) / count
+    sq_mean = (x_num.astype(np.float64) ** 2 * observed_f).sum(axis=0) / count
+    std = np.sqrt(np.clip(sq_mean - mean**2, 0.0, None) + 1e-6)
+    return mean, std
+
+
 def _row_batched_cell_steps(
     task: CompletionTask, rng: np.random.Generator, group_size: int = 1
 ) -> list:
@@ -163,6 +194,14 @@ def generate_ar(
     cat_cardinalities_np = full.cat_cardinalities[cols_g].astype(np.int64)
     cat_decode_types_np = full.cat_decode_types[cols_g].astype(np.int64)
 
+    # Context-only per-column mean/std, computed once (context rows never
+    # change across steps). num_mu is trained via plain MSE against the raw
+    # training target (roughly-standardized synthetic data) and is never
+    # un-normalized internally -- see numeric_context_stats's docstring for
+    # why this is required before num_mu is comparable to a real-world-scale
+    # numeric target (e.g. real OpenML columns).
+    _ctx_mean, _ctx_std = numeric_context_stats(x_num_true, task.observed_mask)
+
     # Working copies: ground truth for originally-observed cells, overwritten
     # with the model's own predictions as each AR step reveals more cells.
     # Never touched for still-hidden (RANK_NEVER) cells -- their true value
@@ -242,8 +281,14 @@ def generate_ar(
                 out_true.append(int(x_cat_true[r, c]))
                 out_pred.append(pred_cls)
             else:
-                pred_val = float(out.num_mu[0, r, c].item())
-                x_num_work[r, c] = pred_val  # feed back
+                pred_val_norm = float(out.num_mu[0, r, c].item())
+                # num_mu is in the model's (roughly-standardized) training
+                # scale -- map back to this column's real-world units before
+                # using it for anything, feedback included (x_num_work must
+                # stay in the same units as x_num_true for context stats on
+                # later steps to mean anything).
+                pred_val = pred_val_norm * float(_ctx_std[c]) + float(_ctx_mean[c])
+                x_num_work[r, c] = pred_val  # feed back, real-world units
                 out_proba.append(np.full(k_max, np.nan, dtype=np.float32))
                 out_true.append(float(x_num_true[r, c]))
                 out_pred.append(pred_val)

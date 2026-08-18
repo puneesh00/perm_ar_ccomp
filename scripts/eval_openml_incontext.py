@@ -77,7 +77,7 @@ from tab_completion.model_perm_ar import (  # noqa: E402
 from tab_completion.model_perm_ar_sparse import (  # noqa: E402
     PermARCompletionModel as PermARCompletionModelSparse,
 )
-from tab_completion.ar_generate import generate_ar  # noqa: E402
+from tab_completion.ar_generate import generate_ar, numeric_context_stats  # noqa: E402
 from tab_completion.sampling import CompletionTask  # noqa: E402
 from tab_completion.factorization import ParallelFactorizer  # noqa: E402
 from tab_completion.synthetic_data import FullSyntheticTable  # noqa: E402
@@ -588,6 +588,10 @@ def _model_output_to_multi_prediction(
     x_num_true = full.x_num[np.ix_(task.row_idx, task.col_idx)]
     x_cat_true = full.x_cat[np.ix_(task.row_idx, task.col_idx)]
 
+    # num_mu is in the model's roughly-standardized training scale, never
+    # un-normalized internally -- see numeric_context_stats's docstring.
+    ctx_mean, ctx_std = numeric_context_stats(x_num_true, task.observed_mask)
+
     k_max = int(cat_card[col_types == CATEGORICAL].max()) if (col_types == CATEGORICAL).any() else 1
 
     rows_out, cols_out, y_true, y_pred, y_proba, is_cat = [], [], [], [], [], []
@@ -607,7 +611,8 @@ def _model_output_to_multi_prediction(
             y_pred.append(pred_cls)
             is_cat.append(True)
         else:
-            pred_val = float(out.num_mu[0, r, c].item())
+            pred_val_norm = float(out.num_mu[0, r, c].item())
+            pred_val = pred_val_norm * float(ctx_std[c]) + float(ctx_mean[c])
             y_proba.append(np.full(k_max, np.nan, dtype=np.float32))
             y_true.append(float(x_num_true[r, c]))
             y_pred.append(pred_val)
@@ -1312,6 +1317,15 @@ def run_task_multi_target(
             # never see a context_row_mask at all) -- only fit/score them once
             # per (task, k), on the first conditioning_mode pass.
             if cond_idx != 0:
+                continue
+
+            # Unlike the "target" regime's build_tuned_pipelines, this block
+            # previously ignored --baseline-models entirely (always ran all
+            # 3 tuned families x 2 modes via RandomizedSearchCV, regardless
+            # of the flag) -- reusing the same empty-string-disables
+            # convention here so a checkpoint-only run doesn't pay for
+            # baseline tuning it doesn't need.
+            if not args.baseline_models.strip():
                 continue
 
             families = build_tuned_multi_col_families(
