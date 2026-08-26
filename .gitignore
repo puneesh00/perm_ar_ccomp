@@ -6,3 +6,5 @@ __pycache__/
 *.ckpt
 *.pth
 .DS_Store
+.venv_tabpfn_v1/
+.venv_tabpfn_v2/

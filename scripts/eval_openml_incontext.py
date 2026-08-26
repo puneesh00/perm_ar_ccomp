@@ -374,6 +374,7 @@ def convert_openml_table_multi(
     max_context: int,
     max_query: int,
     conditioning_mode: str = "inductive_rows",
+    query_frac: float = 1.0,
 ) -> ConvertedTableMulti:
     full, _y_encoded, n_classes, _target_col, max_feature_cardinality, n_cols = (
         _build_full_table_from_df(X, y)
@@ -383,6 +384,12 @@ def convert_openml_table_multi(
     perm = rng.permutation(n_rows)
     n_context = min(n_rows // 2, max_context)
     n_query = min(n_rows - n_context, max_query)
+    if query_frac < 1.0:
+        # Cuts cost by scoring fewer query rows per target-set -- deliberately
+        # applied after n_query is fixed (not by shrinking max_query), so it
+        # only trims the query side and leaves the context/query row split
+        # itself, and thus n_context, untouched.
+        n_query = max(1, int(round(n_query * query_frac)))
     context_idx = perm[:n_context]
     query_idx = perm[n_context : n_context + n_query]
 
@@ -1150,6 +1157,50 @@ def run_task(
             )
 
 
+def _balanced_draws(
+    pool: np.ndarray, group_size: int, n_groups: int, rng: np.random.Generator
+) -> List[np.ndarray]:
+    """n_groups non-overlapping windows of size group_size, built by slicing
+    consecutive shuffled copies of pool concatenated end to end. Guarantees
+    every element of pool is used floor(n_groups*group_size/len(pool)) or
+    that +1 times across the n_groups windows -- independent rng.choice draws
+    give each element only an *expected* count with real sample-to-sample
+    variance, which is what this sidesteps."""
+    if group_size == 0:
+        return [np.array([], dtype=np.int64) for _ in range(n_groups)]
+    needed = n_groups * group_size
+    chunks = []
+    total = 0
+    while total < needed:
+        chunk = rng.permutation(pool)
+        chunks.append(chunk)
+        total += len(chunk)
+    seq = np.concatenate(chunks)[:needed]
+    return [seq[i * group_size : (i + 1) * group_size].astype(np.int64) for i in range(n_groups)]
+
+
+def sample_balanced_target_sets(
+    categorical_cols: np.ndarray,
+    numeric_cols: np.ndarray,
+    k: int,
+    m_cat: int,
+    n_sets: int,
+    rng: np.random.Generator,
+) -> Optional[List[np.ndarray]]:
+    """n_sets balanced target-sets of size k, each with exactly m_cat
+    categorical columns (from categorical_cols) + (k - m_cat) numeric columns
+    (from numeric_cols) -- m_cat is guaranteed by construction (drawn from
+    disjoint pools), never by filtering/rejecting mixed draws. Returns None
+    if this (k, m_cat) cell isn't reachable given how many categorical/
+    numeric columns this dataset actually has."""
+    n_num = k - m_cat
+    if m_cat > len(categorical_cols) or n_num > len(numeric_cols):
+        return None
+    cat_draws = _balanced_draws(categorical_cols, m_cat, n_sets, rng)
+    num_draws = _balanced_draws(numeric_cols, n_num, n_sets, rng)
+    return [np.sort(np.concatenate([c, n])).astype(np.int64) for c, n in zip(cat_draws, num_draws)]
+
+
 def run_task_multi_target(
     task_id: int,
     args,
@@ -1195,174 +1246,195 @@ def run_task_multi_target(
     full_probe, _y_enc, _n_classes, _target_col, _max_card, n_cols_probe = _build_full_table_from_df(
         X, y_raw
     )
-    if args.categorical_only:
-        # Some checkpoints (e.g. TargetPredictionSampler-only training) never
-        # query a numeric cell at all during training -- their num_head never
-        # receives gradient signal and sits at random init, so testing them
-        # on a held-out numeric column measures untrained noise, not a real
-        # capability gap. This restricts query_cols to categorical columns
-        # only, making the run safe to include such checkpoints in.
-        eligible_cols = np.where(full_probe.col_types == CATEGORICAL)[0].astype(np.int64)
-    else:
-        # Eligible for any column (categorical or numeric) -- joint exact-match/
-        # NLL are computed over whichever held-out cells turn out to be
-        # categorical per row (multi_cell_metrics), numeric ones get their own
-        # marginal MSE. Restricting to categorical-only by default would make
-        # k>=2 unreachable on most CC18 datasets, which skew numeric-feature-
-        # heavy (confirmed empirically: tasks 11 and 37 each have exactly 1
-        # categorical column -- the target).
-        eligible_cols = np.arange(n_cols_probe, dtype=np.int64)
+    categorical_cols = np.where(full_probe.col_types == CATEGORICAL)[0].astype(np.int64)
+    numeric_cols = np.where(full_probe.col_types != CATEGORICAL)[0].astype(np.int64)
 
     k_list = [int(k) for k in args.k_cols.split(",")]
     cond_modes = [m.strip() for m in args.conditioning_modes.split(",")]
+    n_sets = args.num_target_sets
 
     for k in k_list:
-        if len(eligible_cols) < k:
-            reason = f"only {len(eligible_cols)} columns available, need k={k}"
-            print(f"  [skip-k] task={task_id} k={k}: {reason}")
-            logger.log(
-                {
-                    "suite": args.suite,
-                    "task_id": task_id,
-                    "task_name": task_name,
-                    "task_type": "multi_target",
-                    "model": None,
-                    "k_cols": k,
-                    "n_features": n_features,
-                    "status": "skipped",
-                    "error": reason,
-                }
+        for m_cat in range(1, k + 1):
+            col_rng = np.random.default_rng([task_id, k, m_cat, args.multi_target_seed])
+            target_sets = sample_balanced_target_sets(
+                categorical_cols, numeric_cols, k, m_cat, n_sets, col_rng
             )
-            continue
-
-        col_rng = np.random.default_rng([task_id, k, args.multi_target_seed])
-        query_cols = np.sort(
-            col_rng.choice(eligible_cols, size=k, replace=False)
-        ).astype(np.int64)
-
-        for cond_idx, conditioning_mode in enumerate(cond_modes):
-            rng = np.random.default_rng([args.seed, task_id, k])
-            table = convert_openml_table_multi(
-                X, y_raw, rng, query_cols, args.max_context, args.max_query, conditioning_mode
-            )
-
-            print(
-                f"[multi_target] task={task_id} name={task_name} k={k} cond={conditioning_mode} "
-                f"n_context={table.n_context} n_query={table.n_query} query_cols={query_cols.tolist()}"
-            )
-
-            def log_row(model_name: str, ar_mode: str, extra: Dict[str, Any]) -> None:
-                row = {
-                    "suite": args.suite,
-                    "task_id": task_id,
-                    "task_name": task_name,
-                    "task_type": "multi_target",
-                    "model": model_name,
-                    "k_cols": k,
-                    "conditioning_mode": conditioning_mode,
-                    "ar_mode": ar_mode,
-                    "n_train": table.n_context,
-                    "n_test": table.n_query,
-                    "n_features": n_features,
-                    "n_classes": table.n_classes,
-                    "status": "ok",
-                }
-                row.update(extra)
-                logger.log(row)
-
-            for ckpt in checkpoints:
-                if ckpt.family == "tabpfn_v1":
-                    continue  # architecturally single-target only.
-
-                skip_reason = eligible_for_checkpoint(table, ckpt)
-                if skip_reason is not None:
-                    print(f"  [skip-model] {ckpt.tag}: {skip_reason}")
-                    log_row(ckpt.tag, "parallel", {"status": "skipped", "error": skip_reason})
-                    continue
-
-                start = time.perf_counter()
-                try:
-                    pred = predict_stream_family_parallel_multi(ckpt, table, device)
-                    metrics = multi_cell_metrics(pred)
-                    log_row(
-                        ckpt.tag, "parallel", {**metrics, "fit_predict_sec": time.perf_counter() - start}
-                    )
-                except Exception as e:
-                    print(f"  [error] {ckpt.tag} parallel: {e}")
-                    log_row(
-                        ckpt.tag,
-                        "parallel",
-                        {"status": "error", "error": repr(e), "traceback": traceback.format_exc()},
-                    )
-
-                if ckpt.family in ("two_stream_ar", "two_stream_ar_sparse"):
-                    start = time.perf_counter()
-                    try:
-                        pred = predict_stream_family_ar_multi(ckpt, table, device)
-                        metrics = multi_cell_metrics(pred)
-                        log_row(
-                            ckpt.tag,
-                            "perm_ar",
-                            {**metrics, "fit_predict_sec": time.perf_counter() - start},
-                        )
-                    except Exception as e:
-                        print(f"  [error] {ckpt.tag} perm_ar: {e}")
-                        log_row(
-                            ckpt.tag,
-                            "perm_ar",
-                            {"status": "error", "error": repr(e), "traceback": traceback.format_exc()},
-                        )
-
-            # Baselines don't depend on the model's conditioning_mode (they
-            # never see a context_row_mask at all) -- only fit/score them once
-            # per (task, k), on the first conditioning_mode pass.
-            if cond_idx != 0:
+            if target_sets is None:
+                reason = (
+                    f"m_cat={m_cat} needs {m_cat} categorical (have {len(categorical_cols)}) + "
+                    f"{k - m_cat} numeric (have {len(numeric_cols)}) columns"
+                )
+                print(f"  [skip-k,m_cat] task={task_id} k={k} m_cat={m_cat}: {reason}")
+                logger.log(
+                    {
+                        "suite": args.suite,
+                        "task_id": task_id,
+                        "task_name": task_name,
+                        "task_type": "multi_target",
+                        "model": None,
+                        "k_cols": k,
+                        "m_cat": m_cat,
+                        "n_features": n_features,
+                        "status": "skipped",
+                        "error": reason,
+                    }
+                )
                 continue
 
-            # Unlike the "target" regime's build_tuned_pipelines, this block
-            # previously ignored --baseline-models entirely (always ran all
-            # 3 tuned families x 2 modes via RandomizedSearchCV, regardless
-            # of the flag) -- reusing the same empty-string-disables
-            # convention here so a checkpoint-only run doesn't pay for
-            # baseline tuning it doesn't need.
-            if not args.baseline_models.strip():
-                continue
+            for cond_idx, conditioning_mode in enumerate(cond_modes):
+                for set_idx, query_cols in enumerate(target_sets):
+                    # Same seed key regardless of m_cat/set_idx -> identical
+                    # context/query row split for every target-set at this
+                    # (task, k), so only the columns vary across draws.
+                    rng = np.random.default_rng([args.seed, task_id, k])
+                    table = convert_openml_table_multi(
+                        X,
+                        y_raw,
+                        rng,
+                        query_cols,
+                        args.max_context,
+                        args.max_query,
+                        conditioning_mode,
+                        query_frac=args.query_frac,
+                    )
 
-            families = build_tuned_multi_col_families(
-                args.seed, args.n_jobs, args.baseline_tuning_iters, args.baseline_cv_folds
-            )
-            baseline_modes = [m.strip() for m in args.baseline_modes.split(",") if m.strip()]
-            baseline_predict_fns = {
-                "independent": predict_baseline_family_multi,
-                "chained": predict_baseline_family_chained,
-            }
-            for name, (clf_factory, reg_factory) in families.items():
-                for mode in baseline_modes:
-                    predict_fn = baseline_predict_fns[mode]
-                    # independent = the fair comparison point for `parallel`
-                    # (no cross-held-out-column conditioning, matching that
-                    # factorization's own independence assumption); chained =
-                    # the fair comparison point for `perm_ar` (conditions on
-                    # other held-out columns via its own predictions, mirroring
-                    # perm_ar's self-conditioned generation).
-                    model_name = name if mode == "independent" else f"{name}_chained"
-                    start = time.perf_counter()
-                    try:
-                        with threadpool_limits(limits=args.n_jobs):
-                            pred = predict_fn(table.full, table.task, clf_factory, reg_factory)
-                        if pred is None:
+                    print(
+                        f"[multi_target] task={task_id} name={task_name} k={k} m_cat={m_cat} "
+                        f"set={set_idx}/{n_sets} cond={conditioning_mode} n_context={table.n_context} "
+                        f"n_query={table.n_query} query_cols={query_cols.tolist()}"
+                    )
+
+                    def log_row(model_name: str, ar_mode: str, extra: Dict[str, Any]) -> None:
+                        row = {
+                            "suite": args.suite,
+                            "task_id": task_id,
+                            "task_name": task_name,
+                            "task_type": "multi_target",
+                            "model": model_name,
+                            "k_cols": k,
+                            "m_cat": m_cat,
+                            "target_set_idx": set_idx,
+                            "conditioning_mode": conditioning_mode,
+                            "ar_mode": ar_mode,
+                            "n_train": table.n_context,
+                            "n_test": table.n_query,
+                            "n_features": n_features,
+                            "n_classes": table.n_classes,
+                            "status": "ok",
+                        }
+                        row.update(extra)
+                        logger.log(row)
+
+                    for ckpt in checkpoints:
+                        if ckpt.family == "tabpfn_v1":
+                            continue  # architecturally single-target only.
+
+                        skip_reason = eligible_for_checkpoint(table, ckpt)
+                        if skip_reason is not None:
+                            print(f"  [skip-model] {ckpt.tag}: {skip_reason}")
+                            log_row(ckpt.tag, "parallel", {"status": "skipped", "error": skip_reason})
                             continue
-                        metrics = multi_cell_metrics(pred)
-                        log_row(
-                            model_name, "n/a", {**metrics, "fit_predict_sec": time.perf_counter() - start}
-                        )
-                    except Exception as e:
-                        print(f"  [error] {model_name}: {e}")
-                        log_row(
-                            model_name,
-                            "n/a",
-                            {"status": "error", "error": repr(e), "traceback": traceback.format_exc()},
-                        )
+
+                        start = time.perf_counter()
+                        try:
+                            pred = predict_stream_family_parallel_multi(ckpt, table, device)
+                            metrics = multi_cell_metrics(pred)
+                            log_row(
+                                ckpt.tag,
+                                "parallel",
+                                {**metrics, "fit_predict_sec": time.perf_counter() - start},
+                            )
+                        except Exception as e:
+                            print(f"  [error] {ckpt.tag} parallel: {e}")
+                            log_row(
+                                ckpt.tag,
+                                "parallel",
+                                {"status": "error", "error": repr(e), "traceback": traceback.format_exc()},
+                            )
+
+                        if ckpt.family in ("two_stream_ar", "two_stream_ar_sparse"):
+                            start = time.perf_counter()
+                            try:
+                                pred = predict_stream_family_ar_multi(ckpt, table, device)
+                                metrics = multi_cell_metrics(pred)
+                                log_row(
+                                    ckpt.tag,
+                                    "perm_ar",
+                                    {**metrics, "fit_predict_sec": time.perf_counter() - start},
+                                )
+                            except Exception as e:
+                                print(f"  [error] {ckpt.tag} perm_ar: {e}")
+                                log_row(
+                                    ckpt.tag,
+                                    "perm_ar",
+                                    {
+                                        "status": "error",
+                                        "error": repr(e),
+                                        "traceback": traceback.format_exc(),
+                                    },
+                                )
+
+                    # Baselines don't depend on the model's conditioning_mode
+                    # (they never see a context_row_mask at all) -- only
+                    # fit/score them once per (task, k, m_cat, target_set), on
+                    # the first conditioning_mode pass.
+                    if cond_idx != 0:
+                        continue
+
+                    # Unlike the "target" regime's build_tuned_pipelines, this
+                    # block previously ignored --baseline-models entirely
+                    # (always ran all 3 tuned families x 2 modes via
+                    # RandomizedSearchCV, regardless of the flag) -- reusing
+                    # the same empty-string-disables convention here so a
+                    # checkpoint-only run doesn't pay for baseline tuning it
+                    # doesn't need. Note this now refits per target-set (not
+                    # once per k) -- leave --baseline-models empty for
+                    # checkpoint-only runs against this grid.
+                    if not args.baseline_models.strip():
+                        continue
+
+                    families = build_tuned_multi_col_families(
+                        args.seed, args.n_jobs, args.baseline_tuning_iters, args.baseline_cv_folds
+                    )
+                    baseline_modes = [m.strip() for m in args.baseline_modes.split(",") if m.strip()]
+                    baseline_predict_fns = {
+                        "independent": predict_baseline_family_multi,
+                        "chained": predict_baseline_family_chained,
+                    }
+                    for name, (clf_factory, reg_factory) in families.items():
+                        for mode in baseline_modes:
+                            predict_fn = baseline_predict_fns[mode]
+                            # independent = the fair comparison point for
+                            # `parallel` (no cross-held-out-column
+                            # conditioning, matching that factorization's own
+                            # independence assumption); chained = the fair
+                            # comparison point for `perm_ar` (conditions on
+                            # other held-out columns via its own predictions,
+                            # mirroring perm_ar's self-conditioned generation).
+                            model_name = name if mode == "independent" else f"{name}_chained"
+                            start = time.perf_counter()
+                            try:
+                                with threadpool_limits(limits=args.n_jobs):
+                                    pred = predict_fn(table.full, table.task, clf_factory, reg_factory)
+                                if pred is None:
+                                    continue
+                                metrics = multi_cell_metrics(pred)
+                                log_row(
+                                    model_name,
+                                    "n/a",
+                                    {**metrics, "fit_predict_sec": time.perf_counter() - start},
+                                )
+                            except Exception as e:
+                                print(f"  [error] {model_name}: {e}")
+                                log_row(
+                                    model_name,
+                                    "n/a",
+                                    {
+                                        "status": "error",
+                                        "error": repr(e),
+                                        "traceback": traceback.format_exc(),
+                                    },
+                                )
 
 
 def main() -> None:
@@ -1378,13 +1450,22 @@ def main() -> None:
     parser.add_argument("--k-cols", type=str, default="1,2,4,8")
     parser.add_argument("--multi-target-seed", type=int, default=0)
     parser.add_argument(
-        "--categorical-only",
-        action="store_true",
-        help="multi_target regime only: draw query_cols from categorical columns only. "
-        "Needed for checkpoints whose num_head never trained (e.g. TargetPredictionSampler-"
-        "only runs, which always query the -- always categorical -- target column). Run once "
-        "with this flag when such a checkpoint is included, once without for the mixed-bag "
-        "comparison among checkpoints that trained on numeric query cells too.",
+        "--num-target-sets",
+        type=int,
+        default=10,
+        help="multi_target regime only: S balanced target-sets sampled per (task, k, m_cat) "
+        "cell (see sample_balanced_target_sets). m_cat=k is the old --categorical-only "
+        "case (all held-out columns categorical) -- it's swept automatically now, no "
+        "separate flag needed; checkpoints with an untrained num_head should be pointed "
+        "at the m_cat=k rows specifically rather than run against the full grid.",
+    )
+    parser.add_argument(
+        "--query-frac",
+        type=float,
+        default=1.0,
+        help="multi_target regime only: fraction of the row-split's query rows actually "
+        "scored (trims cost while keeping the same context/query row split, and thus "
+        "n_context, fixed across every m_cat/target-set draw for a given (task, k)).",
     )
     parser.add_argument(
         "--conditioning-modes",
