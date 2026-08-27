@@ -159,16 +159,28 @@ class ModelConfig:
     # split for it to apply to).
     share_stream_attn: bool = True
     # SingleStreamTokenizer and PermARTokenizer only: drop type_emb (num vs
-    # cat) and origin_emb (observed vs query-this-episode) entirely -- no
-    # additive signal beyond the value encoding itself. Matches TabPFNV1's
-    # actual design: it has no type-identity signal (see
-    # unified_cat_encoding's docstring) and no flag marking which rows'
-    # target slots hold a real label vs. the mean-imputed placeholder --
-    # TargetEncoder relies purely on the row-level context/query attention
-    # split (model_tabpfn_v1.py) for correctness, never a token-level flag.
+    # cat) entirely -- no additive signal for column dtype beyond the value
+    # encoding itself.
     # DEFAULT ON as of 2026-08-09: settled architecture -- see the run
     # log/report for the early-training loss comparison that validated this.
-    drop_type_origin_emb: bool = True
+    drop_type_emb: bool = True
+    # SingleStreamTokenizer and PermARTokenizer only: drop origin_emb
+    # (observed vs query-this-episode) entirely -- no additive signal
+    # marking a cell's role. In PermARTokenizer this is inert either way:
+    # content always carries the true value (origin_emb can't resolve any
+    # ambiguity there), and it's provably constant wherever the query
+    # stream's own output is ever used (every query_mask cell has
+    # is_query_cell == True by construction) -- see model_perm_ar.py.
+    # DEFAULT ON as of 2026-08-09: matches TabPFNV1's actual design, which
+    # has no token-level flag marking which target slots hold a real label
+    # vs. the mean-imputed placeholder -- TargetEncoder relies purely on the
+    # row-level context/query attention split (model_tabpfn_v1.py). Was
+    # split off from a single combined drop_type_origin_emb flag so
+    # SingleStreamTokenizer can re-enable just the role signal (its
+    # closest analogue to TabPFNV1's dedicated y-token) without also
+    # reintroducing the dtype signal -- see the 2pp SingleStream-vs-TabPFN
+    # gap investigation in the run log/report.
+    drop_origin_emb: bool = True
     # SingleStreamModel/PermARCompletionModel: post-LN instead of this
     # codebase's default pre-LN -- attn/ffn operate on the previous stage's
     # raw (already-normalized-once) output, residual add happens first, THEN
@@ -215,6 +227,20 @@ class ModelConfig:
     # during training (checkpointing an eval-mode forward with no backward
     # coming is pure waste). DEFAULT OFF.
     activation_checkpointing: bool = False
+    # SingleStreamModel only: replace the bare Linear(d,1) numerical head and
+    # the TypedCategoricalHead-directly-on-h categorical head with a 2-layer
+    # GELU MLP (d -> decoder_hidden_mult*d -> output) in front of each --
+    # matching TabPFNV1Model's decoder (model_tabpfn_v1.py), which is a real
+    # MLP rather than a single linear unembedding. Numerical and categorical
+    # get separate decoder MLPs (different output distributions); the
+    # categorical one feeds TypedCategoricalHead rather than replacing it, so
+    # the per-table/cardinality machinery is unaffected. Inert for every
+    # other architecture (perm_ar, perm_ar_sparse, one_stream never read this
+    # field). DEFAULT "linear": opt in with --decoder-type mlp and re-measure
+    # against the drop_origin_emb ablation -- see the 2pp SingleStream-vs-
+    # TabPFN gap investigation in the run log/report.
+    decoder_type: str = "linear"
+    decoder_hidden_mult: int = 4
 
 
 class CellTokenizer(nn.Module):

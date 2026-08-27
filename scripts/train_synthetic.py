@@ -211,6 +211,27 @@ def build_factorizer(args) -> object:
     raise ValueError(f"Unknown factorization: {args.factorization}")
 
 
+def resample_variable_table_shape(args, table_generator, sampler, rng: np.random.Generator) -> None:
+    """
+    --variable-table-shape only: redraw n_cols (mutating table_generator's
+    config, read fresh by TabPFNSCMTableGenerator.sample_table /
+    SyntheticTableGenerator.sample_table on every call) and n_context
+    (mutating every n_context-bearing sampler reachable from `sampler`,
+    including each sub-sampler of a MixtureSampler) uniformly from
+    [min, max]. Call once per micro-batch, before sampling that
+    micro-batch's --batch-tasks episodes, so every episode in the batch
+    still shares one (N, D) shape -- required by tasks_to_torch_batch --
+    while shape varies freely across micro-batches/steps.
+    """
+    table_generator.cfg.n_cols = int(rng.integers(args.min_n_cols, args.max_n_cols + 1))
+
+    n_context = int(rng.integers(args.min_n_context, args.max_n_context + 1))
+    sub_samplers = sampler.samplers if hasattr(sampler, "samplers") else [sampler]
+    for sub in sub_samplers:
+        if hasattr(sub, "n_context"):
+            sub.n_context = n_context
+
+
 # ---------------------------------------------------------------------
 # Loss computation
 # ---------------------------------------------------------------------
@@ -892,6 +913,35 @@ def parse_args():
         default=256,
         help="Rows per freshly sampled table when --data-mode=fresh_table.",
     )
+    parser.add_argument(
+        "--variable-table-shape",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="--data-mode fresh_table only: instead of every episode using "
+             "the fixed (--n-context, --n-cols) geometry, redraw n_context "
+             "and n_cols uniformly from [--min-n-context, --max-n-context] / "
+             "[--min-n-cols, --max-n-cols] once per micro-batch (i.e. once "
+             "per grad-accum step, shared by all --batch-tasks episodes in "
+             "that micro-batch -- tasks_to_torch_batch/compute_task_loss_*_"
+             "batched require every episode in one batch to share the same "
+             "(N, D), so shape varies ACROSS micro-batches, not within one). "
+             "--n-query stays fixed at --n-query throughout. Requires "
+             "--min-n-context/--max-n-context/--min-n-cols/--max-n-cols all "
+             "set. Only affects samplers with an n_context/n_query field "
+             "(target/column_block/row_block/label_feature/cell_block); "
+             "random_cell is sized by --n-episode-rows/--query-frac instead "
+             "and is left alone. Does not affect eval, which keeps using "
+             "--n-context/--n-cols (or the matching --eval-*-n-context "
+             "override) for a fixed, comparable-across-runs measurement. "
+             "Also forces the fresh-table generator's target column to "
+             "track n_cols - 1 (whatever --target-col was set to would "
+             "otherwise be out of range or leave the last column unused "
+             "once n_cols varies).",
+    )
+    parser.add_argument("--min-n-context", type=int, default=None)
+    parser.add_argument("--max-n-context", type=int, default=None)
+    parser.add_argument("--min-n-cols", type=int, default=None)
+    parser.add_argument("--max-n-cols", type=int, default=None)
 
     # Sampler
     parser.add_argument(
@@ -1085,14 +1135,47 @@ def parse_args():
              "-- pass --no-share-stream-attn to opt out.",
     )
     parser.add_argument(
-        "--drop-type-origin-emb",
+        "--drop-type-emb",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="single_stream/two_stream_ar only: drop type_emb (num vs cat) "
-             "and origin_emb (observed vs query-this-episode) entirely -- "
-             "no additive signal beyond the value encoding itself, matching "
-             "TabPFNV1's lack of any such flag. Default on -- pass "
-             "--no-drop-type-origin-emb to opt out.",
+             "entirely -- no additive dtype signal beyond the value "
+             "encoding itself, matching TabPFNV1's lack of any such flag. "
+             "Default on -- pass --no-drop-type-emb to opt out.",
+    )
+    parser.add_argument(
+        "--drop-origin-emb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="single_stream/two_stream_ar only: drop origin_emb (observed "
+             "vs query-this-episode) entirely -- no additive role signal "
+             "beyond the value encoding itself. In two_stream_ar/"
+             "two_stream_ar_sparse this is coupled to --drop-type-emb "
+             "(both or neither still apply); in single_stream it's "
+             "independent, so --no-drop-origin-emb alone re-enables just "
+             "the role signal -- this tokenizer's closest analogue to "
+             "TabPFNV1's dedicated y-token. Default on -- pass "
+             "--no-drop-origin-emb to opt out.",
+    )
+    parser.add_argument(
+        "--decoder-type",
+        choices=["linear", "mlp"],
+        default="linear",
+        help="single_stream only: 'linear' keeps the bare Linear(d,1) "
+             "numerical head and TypedCategoricalHead-directly-on-h "
+             "categorical head; 'mlp' puts a 2-layer GELU MLP "
+             "(d -> decoder-hidden-mult*d -> output) in front of each, "
+             "matching TabPFNV1Model's real MLP decoder. Separate MLPs for "
+             "numerical and categorical (different output distributions); "
+             "the categorical one still feeds TypedCategoricalHead "
+             "afterward. Inert for every other architecture.",
+    )
+    parser.add_argument(
+        "--decoder-hidden-mult",
+        type=int,
+        default=4,
+        help="single_stream + --decoder-type mlp only: hidden width of "
+             "each decoder MLP as a multiple of d_model.",
     )
     parser.add_argument(
         "--post-ln",
@@ -1320,6 +1403,47 @@ def main() -> None:
     if args.target_col is None:
         args.target_col = args.n_cols - 1
 
+    if args.variable_table_shape:
+        if args.data_mode != "fresh_table":
+            raise ValueError("--variable-table-shape requires --data-mode fresh_table.")
+        if None in (args.min_n_context, args.max_n_context, args.min_n_cols, args.max_n_cols):
+            raise ValueError(
+                "--variable-table-shape requires --min-n-context, --max-n-context, "
+                "--min-n-cols, and --max-n-cols to all be set."
+            )
+        if args.min_n_context > args.max_n_context:
+            raise ValueError("--min-n-context must be <= --max-n-context.")
+        if args.min_n_cols > args.max_n_cols:
+            raise ValueError("--min-n-cols must be <= --max-n-cols.")
+        if args.min_n_cols < 4:
+            raise ValueError("--min-n-cols must be >= 4 (TabPFNSCMConfig requires n_cols >= 4).")
+        if args.max_n_cols > args.max_cols:
+            raise ValueError(
+                f"--max-n-cols ({args.max_n_cols}) exceeds --max-cols "
+                f"({args.max_cols}), the model's architectural column ceiling."
+            )
+        if args.max_n_context + args.n_query > args.fresh_n_rows:
+            raise ValueError(
+                f"--max-n-context + --n-query ({args.max_n_context} + {args.n_query} "
+                f"= {args.max_n_context + args.n_query}) exceeds --fresh-n-rows "
+                f"({args.fresh_n_rows}); every episode's rows are drawn from one "
+                "freshly sampled table of that size."
+            )
+        if args.max_n_context + args.n_query > args.max_episode_rows:
+            raise ValueError(
+                f"--max-n-context + --n-query exceeds --max-episode-rows "
+                f"({args.max_episode_rows}), the model's architectural row ceiling."
+            )
+        # target_col must track n_cols - 1 once n_cols varies per micro-batch:
+        # a fixed --target-col would go out of range (or silently leave the
+        # true last column of a wider table unused) as soon as a sampled
+        # n_cols != args.n_cols. None makes both the table generator
+        # (make_tabpfn_style_table) and every n_context-based sampler
+        # (TargetPredictionSampler etc., via info.target_col) independently
+        # default to n_cols - 1 for whatever table they're actually looking
+        # at -- see synthetic_data_tabpfn.py / sampling.py.
+        args.target_col = None
+
     if args.run_name is None:
         args.run_name = f"{args.sampler}_{args.factorization}_{int(time.time())}"
 
@@ -1436,7 +1560,10 @@ def main() -> None:
         shared_cat_decoder=args.shared_cat_decoder,
         tabpfn_style_layers=args.tabpfn_style_layers,
         share_stream_attn=args.share_stream_attn,
-        drop_type_origin_emb=args.drop_type_origin_emb,
+        drop_type_emb=args.drop_type_emb,
+        drop_origin_emb=args.drop_origin_emb,
+        decoder_type=args.decoder_type,
+        decoder_hidden_mult=args.decoder_hidden_mult,
         post_ln=args.post_ln,
         global_query_bridge=args.global_query_bridge,
         activation_checkpointing=args.activation_checkpointing,
@@ -1541,6 +1668,9 @@ def main() -> None:
         plan_modes: list[str] = []
 
         for _accum_step in range(args.grad_accum_steps):
+            if args.variable_table_shape:
+                resample_variable_table_shape(args, table_generator, sampler, np_rng)
+
             if args.batched_forward:
                 # Sample all B episodes first, then one real [B, N, D] forward
                 # pass instead of B sequential B=1 passes -- see

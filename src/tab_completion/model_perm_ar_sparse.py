@@ -482,7 +482,11 @@ class PermARTokenizer(nn.Module):
         d = cfg.d_model
         self.share_stream_parameters = bool(cfg.share_stream_attn)
 
-        if not cfg.drop_type_origin_emb:
+        # drop_type_emb / drop_origin_emb (both default True) kept coupled
+        # here (both or neither) -- see model_perm_ar.py's PermARTokenizer
+        # for why this codepath has no use for independently re-enabling
+        # just the role signal the way SingleStreamTokenizer does.
+        if not (cfg.drop_type_emb or cfg.drop_origin_emb):
             self.type_emb = nn.Embedding(2, d)
             self.origin_emb = nn.Embedding(2, d)
 
@@ -604,7 +608,7 @@ class PermARTokenizer(nn.Module):
             cat_vec = self.cat_value_emb[cat_type_clamped, x_cat_clamped]
             content_value = torch.where(is_num.unsqueeze(-1), num_vec, cat_vec)
 
-        if self.cfg.drop_type_origin_emb:
+        if self.cfg.drop_type_emb or self.cfg.drop_origin_emb:
             content = self.content_norm(content_value)
             query_hidden = self.query_token.unsqueeze(0).expand(coords.shape[0], -1)
             query_hidden = self._normalize_query(query_hidden)

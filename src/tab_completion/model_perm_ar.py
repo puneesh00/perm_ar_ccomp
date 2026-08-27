@@ -158,13 +158,16 @@ class PermARTokenizer(nn.Module):
         # whether the same "this was pure nuisance variation" story that
         # applied to row_emb also applies here.
         #
-        # drop_type_origin_emb removes type_emb and origin_emb too: content
-        # always carries the true value (no ambiguity origin_emb could
-        # resolve, and XLNet's own content stream is just e(x_i), nothing
-        # else), and origin_emb is provably constant wherever the query
-        # stream's own output is ever used (every query_mask cell has
-        # is_query_cell == True by construction) -- see ModelConfig.
-        if not cfg.drop_type_origin_emb:
+        # drop_type_emb / drop_origin_emb (both default True) remove type_emb
+        # and origin_emb too: content always carries the true value (no
+        # ambiguity origin_emb could resolve, and XLNet's own content stream
+        # is just e(x_i), nothing else), and origin_emb is provably constant
+        # wherever the query stream's own output is ever used (every
+        # query_mask cell has is_query_cell == True by construction) -- see
+        # ModelConfig. Unlike SingleStreamTokenizer, this tokenizer keeps the
+        # two flags coupled (both or neither) since it has no use for
+        # independently re-enabling just the role signal.
+        if not (cfg.drop_type_emb or cfg.drop_origin_emb):
             self.type_emb = nn.Embedding(2, d)
             # 0 = originally observed (rank == RANK_OBSERVED), 1 = a query
             # cell this episode (finite rank > 0). Purely informational --
@@ -307,7 +310,7 @@ class PermARTokenizer(nn.Module):
 
             query_value = torch.where(is_num.unsqueeze(-1), placeholder_num_vec, placeholder_cat_vec)
 
-        if self.cfg.drop_type_origin_emb:
+        if self.cfg.drop_type_emb or self.cfg.drop_origin_emb:
             content = self.content_norm(content_value)
             query = self.query_norm(query_value)
             return content, query

@@ -71,12 +71,15 @@ class SingleStreamTokenizer(nn.Module):
         # tokenizer -- column/row identity is purely implicit in which
         # attention axis-group a cell is routed through.
         #
-        # drop_type_origin_emb removes these two as well: type_emb (num vs
-        # cat) and origin_emb (0 = observed this episode, 1 = a query cell)
-        # were the last additive, non-value signals left in the tokenizer.
-        # See ModelConfig.drop_type_origin_emb for the TabPFNV1 precedent.
-        if not cfg.drop_type_origin_emb:
+        # type_emb (num vs cat) and origin_emb (0 = observed this episode,
+        # 1 = a query cell) are the last additive, non-value signals left in
+        # the tokenizer -- independently gated so origin_emb (this
+        # tokenizer's closest analogue to TabPFNV1's dedicated y-token) can
+        # be re-enabled without also reintroducing the dtype signal. See
+        # ModelConfig.drop_type_emb / drop_origin_emb.
+        if not cfg.drop_type_emb:
             self.type_emb = nn.Embedding(2, d)
+        if not cfg.drop_origin_emb:
             self.origin_emb = nn.Embedding(2, d)
 
         # unified_cat_encoding drops this entirely -- categorical cells are
@@ -215,14 +218,17 @@ class SingleStreamTokenizer(nn.Module):
 
         value = torch.where(observed.unsqueeze(-1), true_value, placeholder_value)
 
-        if self.cfg.drop_type_origin_emb:
+        if self.cfg.drop_type_emb and self.cfg.drop_origin_emb:
             return self.norm(value)
 
-        pos = self.type_emb(type_ids)
-        is_query_cell = (rank != RANK_OBSERVED) & (rank != RANK_NEVER)
-        origin = self.origin_emb(is_query_cell.long())
+        out = value
+        if not self.cfg.drop_type_emb:
+            out = out + self.type_emb(type_ids)
+        if not self.cfg.drop_origin_emb:
+            is_query_cell = (rank != RANK_OBSERVED) & (rank != RANK_NEVER)
+            out = out + self.origin_emb(is_query_cell.long())
 
-        return self.norm(value + pos + origin)
+        return self.norm(out)
 
 
 class SingleStreamAttention(nn.Module):
@@ -447,7 +453,23 @@ class SingleStreamModel(nn.Module):
 
             self.layers = nn.ModuleList([SingleStreamLayer(cfg, axis) for axis in axes])
         self.final_norm = nn.LayerNorm(cfg.d_model)
-        self.num_head = nn.Linear(cfg.d_model, 1)
+        if cfg.decoder_type == "linear":
+            self.num_decoder = nn.Linear(cfg.d_model, 1)
+            self.cat_decoder = nn.Identity()
+        elif cfg.decoder_type == "mlp":
+            d_ff = cfg.decoder_hidden_mult * cfg.d_model
+            self.num_decoder = nn.Sequential(
+                nn.Linear(cfg.d_model, d_ff),
+                nn.GELU(),
+                nn.Linear(d_ff, 1),
+            )
+            self.cat_decoder = nn.Sequential(
+                nn.Linear(cfg.d_model, d_ff),
+                nn.GELU(),
+                nn.Linear(d_ff, cfg.d_model),
+            )
+        else:
+            raise ValueError(f"Unknown decoder_type {cfg.decoder_type!r}")
         self.cat_head = TypedCategoricalHead(cfg)
 
     def forward(
@@ -470,8 +492,8 @@ class SingleStreamModel(nn.Module):
                 x = layer(x, rank, context_row_mask)
 
         h = self.final_norm(x)
-        num_mu = self.num_head(h).squeeze(-1)
-        cat_logits = self.cat_head(h, batch.cat_decode_types, batch.cat_cardinalities)
+        num_mu = self.num_decoder(h).squeeze(-1)
+        cat_logits = self.cat_head(self.cat_decoder(h), batch.cat_decode_types, batch.cat_cardinalities)
         return ModelOutput(num_mu=num_mu, cat_logits=cat_logits, h=h)
 
 
