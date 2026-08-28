@@ -1272,6 +1272,31 @@ def parse_args():
         help="Cosine decay floor, as a fraction of --lr. Only used when "
              "--warmup-steps > 0.",
     )
+    parser.add_argument(
+        "--lr-schedule", type=str, default="cosine", choices=["cosine", "wsd"],
+        help="'cosine' (default): warmup then cosine decay to --lr-min-ratio "
+             "over the whole --steps horizon -- requires committing to a "
+             "total step count up front. 'wsd': warmup, then flat at --lr "
+             "(the 'stable' phase, run this indefinitely -- set --steps to "
+             "a large ceiling and just stop/kill whenever, relying on "
+             "--checkpoint-every), then --decay-steps of cosine decay to "
+             "--lr-min-ratio at the very end. The decay is a property of "
+             "THIS invocation's (--steps, --decay-steps), not something "
+             "baked into the original run: --resume a stable-phase "
+             "checkpoint from step X with --steps X+N --decay-steps N to "
+             "anneal it over N more steps, decaying from step X --  the "
+             "existing resume path already fast-forwards the scheduler via "
+             "repeated .step() calls, which for steps < decay_start just "
+             "evaluate to the flat 1.0 branch, so no new resume plumbing "
+             "was needed. Only used when --warmup-steps > 0.",
+    )
+    parser.add_argument(
+        "--decay-steps", type=int, default=0,
+        help="--lr-schedule wsd only: length of the final cosine-decay-to-"
+             "--lr-min-ratio phase, ending exactly at --steps. 0 (default) "
+             "means never decay -- flat at --lr for the whole run after "
+             "warmup (the open-ended 'stable' phase).",
+    )
     parser.add_argument("--num-weight", type=float, default=1.0)
     parser.add_argument("--cat-weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -1602,7 +1627,7 @@ def main() -> None:
     )
 
     scheduler = None
-    if args.warmup_steps > 0:
+    if args.warmup_steps > 0 and args.lr_schedule == "cosine":
         warmup_steps = args.warmup_steps
         total_steps = args.steps
         min_ratio = args.lr_min_ratio
@@ -1619,6 +1644,31 @@ def main() -> None:
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         print(f"lr_schedule=warmup({warmup_steps})+cosine(floor={min_ratio}*lr)")
+    elif args.warmup_steps > 0 and args.lr_schedule == "wsd":
+        warmup_steps = args.warmup_steps
+        total_steps = args.steps
+        decay_steps = args.decay_steps
+        min_ratio = args.lr_min_ratio
+        decay_start = max(total_steps - decay_steps, warmup_steps)
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return (step + 1) / max(warmup_steps, 1)
+            if decay_steps <= 0 or step < decay_start:
+                return 1.0
+            progress = (step - decay_start) / max(total_steps - decay_start, 1)
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        if decay_steps > 0:
+            print(
+                f"lr_schedule=warmup({warmup_steps})+stable+"
+                f"decay(last {decay_steps} steps, floor={min_ratio}*lr)"
+            )
+        else:
+            print(f"lr_schedule=warmup({warmup_steps})+stable (no decay this run)")
     else:
         print("lr_schedule=none (flat lr)")
 
