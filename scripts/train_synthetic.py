@@ -668,7 +668,13 @@ def evaluate(
 
     eval_table_generator = None
     if args.data_mode == "fresh_table":
-        if args.data_prior == "tabpfn":
+        # official_v1 deliberately falls into the same branch as tabpfn here:
+        # eval always uses OUR OWN generator regardless of which prior trained
+        # the model, so eval curves stay comparable across --data-prior
+        # choices -- the real comparison for "did training on official's
+        # prior help" is the separate real-data (OpenML) eval run after
+        # training, not this periodic sanity-check curve.
+        if args.data_prior in ("tabpfn", "official_v1"):
             eval_table_generator = TabPFNSCMTableGenerator(
                 TabPFNSCMConfig(
                     n_rows=args.fresh_n_rows,
@@ -877,11 +883,17 @@ def parse_args():
         "--data-prior",
         type=str,
         default="simple",
-        choices=["simple", "tabpfn"],
+        choices=["simple", "tabpfn", "official_v1"],
         help=(
             "simple: the original latent-factor generator (synthetic_data.py). "
             "tabpfn: the SCM/BNN-mixture prior (synthetic_data_tabpfn.py), "
             "richer and with a real accuracy ceiling by construction -- see "
+            "official_v1: the REAL released TabPFN-v1 prior-generation code "
+            "(official_v1_prior_gen.py), not a reimplementation -- requires "
+            "tabpfn==0.1.11 importable (e.g. run from .venv_tabpfn_v1). Only "
+            "affects the TRAINING generator; eval stays on the tabpfn prior "
+            "for comparability across --data-prior choices (see evaluate()'s "
+            "eval_table_generator construction). "
             "that module's docstring. Only wired up for --data-mode fresh_table."
         ),
     )
@@ -1544,6 +1556,20 @@ def main() -> None:
                     layers_max=args.tabpfn_layers_max,
                     hidden_mu_max=args.tabpfn_hidden_mu_max,
                 )
+            )
+        elif args.data_prior == "official_v1":
+            # See official_v1_prior_gen.py's module docstring: generation
+            # does one nn.Module construction per example in a serial Python
+            # loop (mlp.py's new_mlp_per_example=True), which is ~300-500x
+            # slower under torch's default (all-cores) thread count on a
+            # high-core-count machine than under a restricted thread count --
+            # NOT a property of the official code being slow. Only restrict
+            # threads for this data_prior; other priors' own generators may
+            # rely on default threading for their own throughput.
+            torch.set_num_threads(1)
+            from official_v1_prior_gen import OfficialV1LiveTableGenerator
+            table_generator = OfficialV1LiveTableGenerator(
+                n_rows=args.fresh_n_rows, n_cols=args.n_cols, base_seed=args.data_seed,
             )
         else:
             table_generator = SyntheticTableGenerator(
