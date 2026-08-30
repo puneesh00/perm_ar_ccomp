@@ -97,9 +97,24 @@ class SingleStreamTokenizer(nn.Module):
 
         self.norm = nn.LayerNorm(d)
 
-    def forward(self, batch: TableTensorBatch, rank: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        batch: TableTensorBatch,
+        rank: torch.Tensor,
+        context_row_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         rank: [B, N, D] long. Returns one token per cell: [B, N, D, d_model].
+        context_row_mask: [B, N] bool, True = context row. None = transductive
+            (every observed cell may define column stats -- matches the
+            layers' own convention). When given, restricts the column
+            mean/std used for context_normalize (and the query placeholder's
+            mean, used either way) to context rows only -- otherwise a query
+            row's prediction leaks information about every OTHER query row
+            in the same episode through the pooled statistics, even though
+            row-axis attention (gated by this same mask) forbids that
+            channel explicitly. See the plan doc / review this fixes for the
+            full analysis; get_context_row_mask_from_task builds this mask.
         """
         x_num = batch.x_num
         x_cat = batch.x_cat
@@ -123,6 +138,20 @@ class SingleStreamTokenizer(nn.Module):
         observed_num = observed & is_num
         observed_cat = observed & is_cat
 
+        # stats_mask/stats_mask_num: which cells may define column mean/std
+        # (context_normalize) and the query placeholder mean. Narrower than
+        # `observed` under inductive-row conditioning (context rows only);
+        # identical to `observed` under transductive (context_row_mask=None).
+        if context_row_mask is None:
+            stats_mask = observed
+            stats_mask_num = observed_num
+            stats_mask_cat = observed_cat
+        else:
+            row_gate = context_row_mask.unsqueeze(-1)  # [B, N, 1], broadcasts over D
+            stats_mask = observed & row_gate
+            stats_mask_num = observed_num & row_gate
+            stats_mask_cat = observed_cat & row_gate
+
         x_cat_clamped = x_cat.clamp(min=0, max=self.cfg.k_max - 1).long()
         cat_type_clamped = cat_type_ids.clamp(min=0, max=self.cfg.num_cat_decode_types - 1)
 
@@ -136,12 +165,12 @@ class SingleStreamTokenizer(nn.Module):
             # per-column split on the encode side at all.
             x_unified = torch.where(is_num, x_num, x_cat_clamped.to(x_num.dtype))
 
-            unified_sum = (x_unified * observed.to(x_unified.dtype)).sum(dim=1)
-            unified_count = observed.to(x_unified.dtype).sum(dim=1).clamp(min=1.0)
+            unified_sum = (x_unified * stats_mask.to(x_unified.dtype)).sum(dim=1)
+            unified_count = stats_mask.to(x_unified.dtype).sum(dim=1).clamp(min=1.0)
             col_mean = unified_sum / unified_count  # [B, D]
 
             if self.cfg.context_normalize:
-                unified_sq_sum = (x_unified.pow(2) * observed.to(x_unified.dtype)).sum(dim=1)
+                unified_sq_sum = (x_unified.pow(2) * stats_mask.to(x_unified.dtype)).sum(dim=1)
                 col_var = (unified_sq_sum / unified_count - col_mean.pow(2)).clamp(min=0.0)
                 col_std = torch.sqrt(col_var + 1e-6)  # [B, D]
                 x_unified_input = (x_unified - col_mean.unsqueeze(1)) / col_std.unsqueeze(1)
@@ -161,8 +190,8 @@ class SingleStreamTokenizer(nn.Module):
             # Used both to optionally re-standardize x_num per episode
             # (context_normalize) and, either way, to build the query
             # placeholder below. ---
-            num_sum = (x_num * observed_num.to(x_num.dtype)).sum(dim=1)
-            num_count = observed_num.to(x_num.dtype).sum(dim=1).clamp(min=1.0)
+            num_sum = (x_num * stats_mask_num.to(x_num.dtype)).sum(dim=1)
+            num_count = stats_mask_num.to(x_num.dtype).sum(dim=1).clamp(min=1.0)
             col_mean_num = num_sum / num_count  # [B, D]
 
             if self.cfg.context_normalize:
@@ -173,7 +202,7 @@ class SingleStreamTokenizer(nn.Module):
                 # in synthetic_data_tabpfn.py, which pools context+query rows
                 # and never adapts to whichever rows this episode's sampler
                 # actually picked as context.
-                num_sq_sum = (x_num.pow(2) * observed_num.to(x_num.dtype)).sum(dim=1)
+                num_sq_sum = (x_num.pow(2) * stats_mask_num.to(x_num.dtype)).sum(dim=1)
                 col_var_num = (num_sq_sum / num_count - col_mean_num.pow(2)).clamp(min=0.0)
                 col_std_num = torch.sqrt(col_var_num + 1e-6)  # [B, D]
                 x_num_input = (x_num - col_mean_num.unsqueeze(1)) / col_std_num.unsqueeze(1)
@@ -202,7 +231,7 @@ class SingleStreamTokenizer(nn.Module):
 
             k_max = self.cfg.k_max
             x_cat_onehot = F.one_hot(x_cat_clamped, num_classes=k_max).to(dtype=self.cat_value_emb.dtype)
-            x_cat_onehot = x_cat_onehot * observed_cat.unsqueeze(-1).to(x_cat_onehot.dtype)
+            x_cat_onehot = x_cat_onehot * stats_mask_cat.unsqueeze(-1).to(x_cat_onehot.dtype)
             cat_counts = x_cat_onehot.sum(dim=1)  # [B, D, K]
             cat_totals = cat_counts.sum(dim=-1, keepdim=True).clamp(min=1.0)
             cat_probs = cat_counts / cat_totals
@@ -478,7 +507,7 @@ class SingleStreamModel(nn.Module):
         rank: torch.Tensor,
         context_row_mask: Optional[torch.Tensor] = None,
     ) -> ModelOutput:
-        x = self.tokenizer(batch, rank)
+        x = self.tokenizer(batch, rank, context_row_mask)
         use_checkpoint = self.training and self.cfg.activation_checkpointing
         for layer in self.layers:
             if use_checkpoint:

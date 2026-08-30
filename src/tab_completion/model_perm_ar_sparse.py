@@ -517,12 +517,21 @@ class PermARTokenizer(nn.Module):
         batch: TableTensorBatch,
         rank: torch.Tensor,
         prediction_mask: Optional[torch.Tensor] = None,
+        context_row_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, SparseQueryState]:
         """
         Args:
             rank: [B,N,D] reveal ranks.
             prediction_mask: optional bool [B,N,D]. Query states are built
                 only here. If omitted, every finite-rank target is predicted.
+            context_row_mask: [B,N] bool, True = context row. None =
+                transductive. Restricts the column mean/std used for
+                context_normalize to context rows only -- see
+                model_single_stream.py's SingleStreamTokenizer.forward for
+                the full leak analysis this fixes (identical bug, same fix;
+                this tokenizer has no context-derived categorical
+                placeholder to also patch -- the sparse query stream uses a
+                fixed learned query_token instead).
 
         Returns:
             content: [B,N,D,d] true-value content stream.
@@ -569,6 +578,14 @@ class PermARTokenizer(nn.Module):
         observed = rank == RANK_OBSERVED
         observed_num = observed & is_num
 
+        if context_row_mask is None:
+            stats_mask = observed
+            stats_mask_num = observed_num
+        else:
+            row_gate = context_row_mask.unsqueeze(-1)  # [B, N, 1], broadcasts over D
+            stats_mask = observed & row_gate
+            stats_mask_num = observed_num & row_gate
+
         x_cat_clamped = x_cat.clamp(min=0, max=self.cfg.k_max - 1).long()
         cat_type_clamped = cat_type_ids.clamp(
             min=0, max=self.cfg.num_cat_decode_types - 1
@@ -576,12 +593,12 @@ class PermARTokenizer(nn.Module):
 
         if self.cfg.unified_cat_encoding:
             x_unified = torch.where(is_num, x_num, x_cat_clamped.to(x_num.dtype))
-            observed_f = observed.to(x_unified.dtype)
-            count = observed_f.sum(dim=1).clamp(min=1.0)
-            mean = (x_unified * observed_f).sum(dim=1) / count
+            stats_f = stats_mask.to(x_unified.dtype)
+            count = stats_f.sum(dim=1).clamp(min=1.0)
+            mean = (x_unified * stats_f).sum(dim=1) / count
 
             if self.cfg.context_normalize:
-                sq_mean = (x_unified.pow(2) * observed_f).sum(dim=1) / count
+                sq_mean = (x_unified.pow(2) * stats_f).sum(dim=1) / count
                 std = torch.sqrt((sq_mean - mean.pow(2)).clamp(min=0.0) + 1e-6)
                 x_input = ((x_unified - mean.unsqueeze(1)) / std.unsqueeze(1)).clamp(
                     min=-100.0, max=100.0
@@ -591,12 +608,12 @@ class PermARTokenizer(nn.Module):
 
             content_value = self.num_value_mlp(x_input.unsqueeze(-1))
         else:
-            observed_num_f = observed_num.to(x_num.dtype)
-            count = observed_num_f.sum(dim=1).clamp(min=1.0)
-            mean = (x_num * observed_num_f).sum(dim=1) / count
+            stats_num_f = stats_mask_num.to(x_num.dtype)
+            count = stats_num_f.sum(dim=1).clamp(min=1.0)
+            mean = (x_num * stats_num_f).sum(dim=1) / count
 
             if self.cfg.context_normalize:
-                sq_mean = (x_num.pow(2) * observed_num_f).sum(dim=1) / count
+                sq_mean = (x_num.pow(2) * stats_num_f).sum(dim=1) / count
                 std = torch.sqrt((sq_mean - mean.pow(2)).clamp(min=0.0) + 1e-6)
                 x_num_input = ((x_num - mean.unsqueeze(1)) / std.unsqueeze(1)).clamp(
                     min=-100.0, max=100.0
@@ -1101,7 +1118,7 @@ class PermARCompletionModel(nn.Module):
             prediction_mask: optional [B,N,D] subset for which g states and
                 losses are required. Defaults to all finite-rank targets.
         """
-        content, query = self.tokenizer(batch, rank, prediction_mask)
+        content, query = self.tokenizer(batch, rank, prediction_mask, context_row_mask)
         cache = _build_attention_cache(
             rank, query, context_row_mask, build_global_bridge=self.cfg.global_query_bridge
         )

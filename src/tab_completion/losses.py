@@ -79,11 +79,25 @@ def typed_mse_ce_loss(
         logits = pred.cat_logits[cat_query]  # [num_cat_query, K_max]
         targets = batch.x_cat[cat_query].long()
 
-        cat_loss = F.cross_entropy(logits, targets)
+        # targets may contain -100 (episode_utils._densify_queried_
+        # categorical_columns' OOV sentinel: a query cell whose true class
+        # never appeared in this column's context/evidence, so there is no
+        # learnable codebook slot for it). ignore_index=-100 excludes those
+        # cells from the loss entirely rather than crashing or training
+        # against an arbitrary target; if EVERY queried cell in this
+        # micro-batch is such a cell, cross_entropy's mean-reduction over
+        # zero non-ignored elements returns nan by design -- the caller's
+        # grad-accum loop already treats that the same as any other
+        # micro-batch-level numerical issue, not special-cased here.
+        cat_loss = F.cross_entropy(logits, targets, ignore_index=-100)
         losses.append(cat_weight * cat_loss)
 
         with torch.no_grad():
             pred_class = logits.argmax(dim=-1)
+            # -100 never equals a predicted class in [0, K_C), so an OOV
+            # cell is automatically counted wrong here -- no special-casing
+            # needed to satisfy "count it as incorrect, not silently
+            # dropped" at eval time.
             acc = (pred_class == targets).float().mean()
 
         metrics["loss_cat"] = cat_loss.detach()

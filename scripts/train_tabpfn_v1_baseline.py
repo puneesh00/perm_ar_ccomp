@@ -39,6 +39,7 @@ from train_synthetic import (
     logreg_context_baseline_acc,
     rf_context_baseline_acc,
     xgb_context_baseline_acc,
+    resample_variable_table_shape,
 )
 
 
@@ -184,13 +185,30 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--tabpfn-prior-type", type=str, default="scm")
     p.add_argument("--tabpfn-layers-mu-max", type=float, default=3.0)
-    p.add_argument("--tabpfn-layers-max", type=int, default=4)
+    p.add_argument("--tabpfn-layers-max", type=int, default=None)
     p.add_argument("--tabpfn-hidden-mu-max", type=float, default=40.0)
     p.add_argument("--fresh-n-rows", type=int, default=256)
     p.add_argument("--n-cols", type=int, default=16)
     p.add_argument("--target-col", type=int, default=None)
     p.add_argument("--p-categorical", type=float, default=0.3)
     p.add_argument("--k-max", type=int, default=16)
+    p.add_argument(
+        "--variable-table-shape",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Mirrors train_synthetic.py's flag of the same name: instead of "
+             "every episode using the fixed (--n-context, --n-cols) geometry, "
+             "redraw n_context and n_cols uniformly from [--min-n-context, "
+             "--max-n-context] / [--min-n-cols, --max-n-cols] once per "
+             "grad-accum micro-batch. --n-query stays fixed at --n-query "
+             "throughout. Does not affect eval, which keeps using "
+             "--eval-n-context/--n-cols for a fixed, comparable-across-runs "
+             "measurement.",
+    )
+    p.add_argument("--min-n-context", type=int, default=None)
+    p.add_argument("--max-n-context", type=int, default=None)
+    p.add_argument("--min-n-cols", type=int, default=None)
+    p.add_argument("--max-n-cols", type=int, default=None)
     p.add_argument(
         "--max-num-classes", type=int, default=10,
         help="Fixed output-head width (upper bound on per-table sampled class "
@@ -249,6 +267,30 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.variable_table_shape:
+        if None in (args.min_n_context, args.max_n_context, args.min_n_cols, args.max_n_cols):
+            raise ValueError(
+                "--variable-table-shape requires --min-n-context, --max-n-context, "
+                "--min-n-cols, and --max-n-cols to all be set."
+            )
+        if args.min_n_context > args.max_n_context:
+            raise ValueError("--min-n-context must be <= --max-n-context.")
+        if args.min_n_cols > args.max_n_cols:
+            raise ValueError("--min-n-cols must be <= --max-n-cols.")
+        if args.min_n_cols < 4:
+            raise ValueError("--min-n-cols must be >= 4 (TabPFNSCMConfig requires n_cols >= 4).")
+        if args.max_n_context + args.n_query > args.fresh_n_rows:
+            raise ValueError(
+                f"--max-n-context + --n-query ({args.max_n_context} + {args.n_query} "
+                f"= {args.max_n_context + args.n_query}) exceeds --fresh-n-rows "
+                f"({args.fresh_n_rows}); every episode's rows are drawn from one "
+                "freshly sampled table of that size."
+            )
+        # target_col must track n_cols - 1 once n_cols varies per micro-batch --
+        # see train_synthetic.py's identical validation block for why.
+        args.target_col = None
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir) / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -331,13 +373,16 @@ def main():
         correct_sum_t = torch.zeros((), device=device)
         total_count = 0
         for _ in range(args.grad_accum_steps):
+            if args.variable_table_shape:
+                resample_variable_table_shape(args, table_generator, sampler, np_rng)
+
             x_feat_t, y_ctx_t, y_qry_t, num_valid_classes_t, _ = make_batch(
-                table_generator, sampler, np_rng, args.batch_tasks, args.n_context, args.n_query, device,
+                table_generator, sampler, np_rng, args.batch_tasks, sampler.n_context, args.n_query, device,
                 baselines=False,
             )
             with autocast_ctx(args, device):
                 logits = model(
-                    x_feat_t, y_ctx_t, args.n_context, num_valid_classes=num_valid_classes_t
+                    x_feat_t, y_ctx_t, sampler.n_context, num_valid_classes=num_valid_classes_t
                 )  # [B, n_query, max_num_classes]
 
                 loss = torch.nn.functional.cross_entropy(

@@ -43,19 +43,51 @@ from run_openml_baselines import (  # noqa: E402
 from eval_openml_incontext import convert_openml_table  # noqa: E402
 
 
-def build_model(version: str, device: str, seed: int):
+def build_model(version: str, device: str, seed: int, n_estimators: int = 1, no_tricks: bool = False):
+    """no_tricks=True: a single forward pass with every inference-time
+    augmentation disabled (no feature/class shift, no preprocessing-
+    transform ensemble, no fingerprint feature, no outlier clipping, no
+    probability balancing, no temperature sharpening) -- see
+    eval_synthetic_official_tabpfn.build_model's docstring for the full
+    rationale and what deliberately stays on (the checkpoint's own required
+    input contract, not an ensemble trick). Verified against the actually-
+    installed versions (tabpfn==0.1.11 for v1, tabpfn==2.2.1 for v2).
+    n_estimators is ignored when no_tricks=True (forced to a single pass).
+    """
     if version == "v1":
         from tabpfn import TabPFNClassifier
 
-        # N_ensemble_configurations=32 matches the TabPFN-v1 paper's default
-        # full ensemble (the pip package's own default of 3 is a fast/light
-        # mode) -- this is meant to be the strongest official-checkpoint
-        # comparison point, not the cheapest one.
-        return TabPFNClassifier(device=device, seed=seed, N_ensemble_configurations=32)
+        if no_tricks:
+            return TabPFNClassifier(
+                device=device, seed=seed, N_ensemble_configurations=1,
+                no_preprocess_mode=True, feature_shift_decoder=False, multiclass_decoder="none",
+            )
+        # n_estimators default is 1 (single forward pass, matching our own
+        # checkpoints -- no ensembling), overridable for the ensembled
+        # comparison point: the TabPFN-v1 paper's default full ensemble is
+        # N_ensemble_configurations=32 (the pip package's own default of 3
+        # is a fast/light mode).
+        return TabPFNClassifier(device=device, seed=seed, N_ensemble_configurations=n_estimators)
     elif version == "v2":
         from tabpfn import TabPFNClassifier
 
-        return TabPFNClassifier(device=device, random_state=seed)
+        if no_tricks:
+            from tabpfn.preprocessing import PreprocessorConfig
+
+            return TabPFNClassifier(
+                device=device, random_state=seed, n_estimators=1,
+                softmax_temperature=1.0, balance_probabilities=False,
+                inference_config={
+                    "PREPROCESS_TRANSFORMS": [PreprocessorConfig("none")],
+                    "FEATURE_SHIFT_METHOD": None,
+                    "CLASS_SHIFT_METHOD": None,
+                    "FINGERPRINT_FEATURE": False,
+                    "OUTLIER_REMOVAL_STD": None,
+                    "POLYNOMIAL_FEATURES": "no",
+                    "SUBSAMPLE_SAMPLES": None,
+                },
+            )
+        return TabPFNClassifier(device=device, random_state=seed, n_estimators=n_estimators)
     raise ValueError(f"Unknown version {version!r}")
 
 
@@ -124,7 +156,7 @@ def run_task(task_id: int, args, logger: JSONLLogger) -> None:
 
     start = time.perf_counter()
     try:
-        clf = build_model(args.version, args.device, args.seed)
+        clf = build_model(args.version, args.device, args.seed, args.n_estimators, args.no_tricks)
         clf.fit(X_train, table.y_train)
         proba_raw = clf.predict_proba(X_test)
         proba = padded_proba(proba_raw, np.asarray(clf.classes_), table.n_classes)
@@ -169,6 +201,16 @@ def main() -> None:
 
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--n-estimators", type=int, default=1,
+                         help="ensemble size / N_ensemble_configurations for the official checkpoint. "
+                              "Default 1 (single forward pass, matching our own checkpoints -- no "
+                              "ensembling). v1's paper default is 32, v2's package default is 8. "
+                              "Ignored when --no-tricks is set.")
+    parser.add_argument("--no-tricks", action="store_true",
+                         help="Single forward pass with every inference-time augmentation disabled "
+                              "(no feature/class shift, no preprocessing-transform ensemble, no "
+                              "fingerprint feature, no outlier clipping, no probability balancing, "
+                              "no temperature sharpening) -- see build_model's docstring.")
     parser.add_argument("--out-dir", type=str, default="results/openml_incontext")
     parser.add_argument("--run-name", type=str, default=None)
 
