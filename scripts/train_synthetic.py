@@ -1841,9 +1841,22 @@ def main() -> None:
         else:
             grad_norm = torch.tensor(0.0)
 
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        # Skip the optimizer step on a non-finite gradient rather than let
+        # it permanently poison Adam's running-average state. Mainly
+        # relevant for --data-prior official_v1: official's own real
+        # hyperparameter ranges occasionally produce a numerically
+        # degenerate table (their own generator's NaN-in-generation safety
+        # net catches most of these before they reach us, but extreme-yet-
+        # finite draws under bf16 can still slip through as a non-finite
+        # loss on rare micro-batches). See train_tabpfn_v1_baseline.py's
+        # identical guard for the same reasoning.
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+        else:
+            print(f"[step {step:06d}] WARNING: non-finite grad_norm={float(grad_norm)}, skipping optimizer step")
+            optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_every == 0 or step == 1:
             now = time.time()

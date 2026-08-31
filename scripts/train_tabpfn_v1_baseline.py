@@ -81,11 +81,29 @@ def build_xy(full: FullSyntheticTable, task, n_context: int, n_query: int):
     y_context_raw = y_all[:n_context]
     y_query_raw = y_all[n_context:]
 
+    # -100 is torch's cross_entropy ignore_index, not a real class id. It can
+    # appear here whole-table when an upstream generator explicitly marks a
+    # table as unusable (e.g. official_v1_prior_gen.py's underlying mlp.py
+    # zeroing out a numerically-degenerate table: x[:]=0.0, y[:]=-100, on
+    # detecting NaN mid-generation). Excluding it from unique_context is
+    # required for that exclusion to actually take effect -- without this,
+    # a context that's entirely -100 gets treated as one legitimate
+    # "class" (remap={-100: 0}), and every query row -- including ones
+    # that were also -100 -- gets assigned to that class instead of being
+    # ignored, turning an explicitly-discarded table into a spurious
+    # included training signal.
     unique_context = np.unique(y_context_raw)
+    unique_context = unique_context[unique_context != -100]
     num_valid_classes = int(unique_context.shape[0])
     remap = {int(v): i for i, v in enumerate(unique_context.tolist())}
 
-    y_context = np.array([remap[int(v)] for v in y_context_raw], dtype=np.float32)
+    # A context row can itself be -100 (or any value absent from
+    # unique_context) only in the fully-degenerate whole-table case above,
+    # where num_valid_classes==0 and every query row is about to be ignored
+    # via the -100 fallback below anyway -- context_row's exact embedded
+    # value is then moot for the loss, so fall back to slot 0 rather than
+    # a bare `remap[...]` KeyError.
+    y_context = np.array([remap.get(int(v), 0) for v in y_context_raw], dtype=np.float32)
     y_query = np.array(
         [remap.get(int(v), -100) for v in y_query_raw], dtype=np.int64
     )
@@ -385,9 +403,18 @@ def main():
                     x_feat_t, y_ctx_t, sampler.n_context, num_valid_classes=num_valid_classes_t
                 )  # [B, n_query, max_num_classes]
 
-                loss = torch.nn.functional.cross_entropy(
-                    logits.reshape(-1, args.max_num_classes), y_qry_t.reshape(-1), ignore_index=-100
+                targets_flat = y_qry_t.reshape(-1)
+                per_elem_loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, args.max_num_classes), targets_flat,
+                    ignore_index=-100, reduction="none",
                 )
+                # Matches official train.py's own torch_nanmean pattern --
+                # see train_tabpfn_v1_baseline_official_prior.py's identical
+                # block for the full reasoning. Harmless here (our own
+                # generator doesn't produce this), kept for consistency
+                # since build_xy is shared by both scripts.
+                valid_mask = (targets_flat != -100) & torch.isfinite(per_elem_loss)
+                loss = per_elem_loss[valid_mask].mean() if valid_mask.any() else torch.zeros((), device=device)
             (loss / args.grad_accum_steps).backward()
 
             # Stay on-device here (no .item()/.cpu()) -- syncing every
@@ -406,9 +433,19 @@ def main():
         else:
             grad_norm = torch.tensor(0.0)
 
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        # Skip the optimizer step on a non-finite gradient rather than let
+        # it permanently poison Adam's running-average state -- see
+        # train_tabpfn_v1_baseline_official_prior.py's identical guard for
+        # why (an occasional numerically-degenerate synthetic table can
+        # still produce a non-finite loss/gradient even after build_xy's
+        # own -100-handling fix).
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+        else:
+            print(f"[step {step:06d}] WARNING: non-finite grad_norm={float(grad_norm)}, skipping optimizer step")
+            optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_every == 0 or step == 1:
             avg_loss = (loss_sum_t / args.grad_accum_steps).item()

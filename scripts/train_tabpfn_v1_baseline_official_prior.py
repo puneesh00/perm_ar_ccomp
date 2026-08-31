@@ -214,9 +214,25 @@ def main():
                 logits = model(
                     x_feat_t, y_ctx_t, sampler.n_context, num_valid_classes=num_valid_classes_t
                 )
-                loss = torch.nn.functional.cross_entropy(
-                    logits.reshape(-1, args.max_num_classes), y_qry_t.reshape(-1), ignore_index=-100
+                targets_flat = y_qry_t.reshape(-1)
+                per_elem_loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, args.max_num_classes), targets_flat,
+                    ignore_index=-100, reduction="none",
                 )
+                # Matches official train.py's own torch_nanmean pattern
+                # exactly (verified against the real source, not guessed):
+                # average only over cells that are both real targets (not
+                # the -100 ignore_index) AND numerically finite. Official's
+                # own real hyperparameter ranges can occasionally still
+                # produce a non-finite per-cell loss even on an otherwise
+                # valid target (their own generator's per-table NaN
+                # zero-out -- see build_xy's -100 handling -- doesn't catch
+                # every source of instability); masking out just those
+                # cells, not the whole micro-batch, extracts as much real
+                # gradient signal as possible from the rest, same as the
+                # reference training loop does.
+                valid_mask = (targets_flat != -100) & torch.isfinite(per_elem_loss)
+                loss = per_elem_loss[valid_mask].mean() if valid_mask.any() else torch.zeros((), device=device)
             (loss / args.grad_accum_steps).backward()
 
             loss_sum_t += loss.detach()
@@ -229,9 +245,25 @@ def main():
         else:
             grad_norm = torch.tensor(0.0)
 
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        # Official's own real prior occasionally produces a numerically
+        # degenerate table (mlp.py's own NaN-in-generation safety net,
+        # x[:]=0/y[:]=-100 -- see this repo's own record of the build_xy
+        # fix for the semantic half of this). Even with that fix, extreme
+        # (but finite) hyperparameter draws under bf16 can still produce a
+        # non-finite loss/gradient on rare micro-batches. Skip the
+        # optimizer step entirely when that happens rather than let a NaN
+        # gradient permanently poison Adam's running-average state (which
+        # would otherwise corrupt every subsequent step) -- optimizer.step()
+        # is the only thing that consumes the current gradient into that
+        # state, so not calling it here leaves the optimizer exactly as it
+        # was after the last good step.
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+        else:
+            print(f"[step {step:06d}] WARNING: non-finite grad_norm={float(grad_norm)}, skipping optimizer step")
+            optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_every == 0 or step == 1:
             avg_loss = (loss_sum_t / args.grad_accum_steps).item()
