@@ -72,9 +72,10 @@ from tab_completion.synthetic_data import FullSyntheticTable  # noqa: E402
 def bypass_import_priors():
     """tabpfn/priors/__init__.py eagerly imports fast_gp -> gpytorch (often
     not installed). Register a stub package module so mlp.py/
-    flexible_categorical.py's relative imports resolve without executing the
-    real __init__.py. Locates the installed tabpfn package dynamically
-    (importlib.util.find_spec) rather than hardcoding a venv path."""
+    flexible_categorical.py's/differentiable_prior.py's relative imports
+    resolve without executing the real __init__.py. Locates the installed
+    tabpfn package dynamically (importlib.util.find_spec) rather than
+    hardcoding a venv path."""
     tabpfn_spec = importlib.util.find_spec("tabpfn")
     if tabpfn_spec is None or not tabpfn_spec.submodule_search_locations:
         raise ImportError(
@@ -94,7 +95,89 @@ def bypass_import_priors():
     sys.modules[pkg_name] = stub
     mlp = importlib.import_module("tabpfn.priors.mlp")
     flexible_categorical = importlib.import_module("tabpfn.priors.flexible_categorical")
-    return mlp, flexible_categorical
+    differentiable_prior = importlib.import_module("tabpfn.priors.differentiable_prior")
+    return mlp, flexible_categorical, differentiable_prior
+
+
+# Extracted directly from the ACTUAL released checkpoint's saved config
+# (tabpfn/models_diff/prior_diff_real_checkpoint_n_0_epoch_42.cpkt --
+# torch.load(path)[2]['differentiable_hyperparameters']), not from the
+# current tabpfn==0.1.11 pip package's model_configs.py. The two disagree
+# for several entries (num_layers/prior_mlp_hidden_dim/num_causes use Gamma
+# in the currently-shipped model_configs.py's get_diff_causal(), but TNLU
+# -- matching the TabPFN-v1 PAPER's Table 5 exactly -- in the checkpoint
+# that actually trained the weights we're comparing against; similarly
+# prior_mlp_dropout_prob's Beta scale is 0.6 in the shipped code vs 0.9 in
+# the checkpoint, and prior_mlp_activations has 3 choices in the shipped
+# code vs 4 in the checkpoint). The checkpoint is the more authoritative
+# source for OUR purpose (explaining/matching that specific checkpoint's
+# performance) -- verified with torch.load's own config_sample dict, not
+# inferred. See this repo's own record of that investigation.
+#
+# `is_causal` IS present in the real checkpoint's differentiable_hyperparameters
+# (choice_values=[True, False], meaning it really did mix in noncausal/
+# "BNN"-like tables) -- deliberately OMITTED here and pinned to True in
+# generate_official_v1_table's static hyperparameters instead, per explicit
+# decision to exclude that branch. This is therefore a known, deliberate
+# simplification relative to the real checkpoint, not an accidental match.
+#
+# GP: prior_bag_exp_weights_1 in the real checkpoint's config is
+# Uniform(1000000, 1000001) -- softmax([1.0, ~1e6]) selects the MLP branch
+# (index 1 in model_builder.py's `(get_batch_gp, get_batch_mlp)` tuple) with
+# ~100% probability every time; GP (index 0) was never meaningfully invoked
+# in the real checkpoint's actual training despite prior_type='prior_bag'
+# nominally including it. So omitting GP here isn't just a pragmatic
+# shortcut -- it's confirmed to match what the real checkpoint's training
+# actually did.
+#
+# `prior_mlp_activations`'s 4th real choice is a lambda pickled as an
+# unrecoverable string repr (function objects don't survive torch.load as
+# live callables) -- from context (Tanh/Identity/ELU are the other three,
+# and the paper's Table 5 lists {Tanh, LeakyReLU, ELU, Identity}) it's
+# almost certainly a LeakyReLU wrapper. Using torch.nn.LeakyReLU directly
+# (default negative_slope=0.01) as the closest available stand-in -- the
+# one item here that's still an approximation, not a checkpoint-verified
+# exact value.
+DIFF_CAUSAL_CONFIG = {
+    "num_layers": {"distribution": "meta_trunc_norm_log_scaled", "max_mean": 6, "min_mean": 1, "round": True, "lower_bound": 2},
+    "prior_mlp_hidden_dim": {"distribution": "meta_trunc_norm_log_scaled", "max_mean": 130, "min_mean": 5, "round": True, "lower_bound": 4},
+    "prior_mlp_dropout_prob": {"distribution": "meta_beta", "scale": 0.9, "min": 0.1, "max": 5.0},
+    "noise_std": {"distribution": "meta_trunc_norm_log_scaled", "max_mean": 0.3, "min_mean": 0.0001, "round": False, "lower_bound": 0.0},
+    "init_std": {"distribution": "meta_trunc_norm_log_scaled", "max_mean": 10.0, "min_mean": 0.01, "round": False, "lower_bound": 0.0},
+    "num_causes": {"distribution": "meta_trunc_norm_log_scaled", "max_mean": 12, "min_mean": 1, "round": True, "lower_bound": 1},
+    "pre_sample_weights": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "pre_sample_causes": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "y_is_effect": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "sampling": {"distribution": "meta_choice", "choice_values": ["normal", "mixed"]},
+    "prior_mlp_activations": {"distribution": "meta_choice_mixed", "choice_values": [
+        torch.nn.Tanh, torch.nn.Identity, torch.nn.ELU, torch.nn.LeakyReLU,
+    ]},
+    "block_wise_dropout": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "sort_features": {"distribution": "meta_choice", "choice_values": [True, False]},
+    "in_clique": {"distribution": "meta_choice", "choice_values": [True, False]},
+    # --- from get_diff_flex() ---
+    # output_multiclass_ordered_p is NOT actually in the checkpoint's real
+    # differentiable_hyperparameters dict (verified by mechanically diffing
+    # every key against the checkpoint -- this repo's earlier assumption
+    # that it was differentiable, because the general model_configs.py
+    # lists it that way, was wrong for THIS checkpoint). It's a fixed
+    # static 0.0 there instead -- set as a static hyperparameter below, not
+    # sampled here.
+    "multiclass_type": {"distribution": "meta_choice", "choice_values": ["value", "rank"]},
+}
+
+
+def build_differentiable_hparams(differentiable_prior):
+    """Constructs the DifferentiableHyperparameterList ONCE (reused across
+    every table generated in this process) -- official's own real sampling
+    code (gamma/truncated-normal/beta draws, softmax-weighted meta_choice),
+    not a reimplementation. See DIFF_CAUSAL_CONFIG's docstring for exactly
+    what's in it and what's deliberately excluded. embedding_dim is a dead
+    parameter in this code path (only used by commented-out embedding-layer
+    code) -- value doesn't matter, kept at 1."""
+    return differentiable_prior.DifferentiableHyperparameterList(
+        DIFF_CAUSAL_CONFIG, embedding_dim=1, device="cpu",
+    )
 
 
 _PATCHED = False
@@ -203,39 +286,75 @@ def _install_instrumented_forward(flexible_categorical):
 
 
 def generate_official_v1_table(
-    mlp, flexible_categorical, rng: np.random.Generator,
+    mlp, flexible_categorical, diff_hparams, rng: np.random.Generator,
     num_features: int, n_context: int, n_query: int,
-    categorical_feature_p_choices=(0.0, 0.1, 0.2),
+    categorical_feature_p: float = 0.2,
 ) -> Tuple[np.ndarray, np.ndarray, int, Dict[int, int]]:
     """Returns (x_np [seq_len, num_features] float32, y_np [seq_len] float,
     num_classes int, feature_cat_info {col: cardinality} for columns
-    actually converted to categorical this table -- empty dict if none)."""
+    actually converted to categorical this table -- empty dict if none).
+
+    diff_hparams: a DifferentiableHyperparameterList (see
+    build_differentiable_hparams) -- sample_parameter_object() is called
+    once per table, exactly mirroring official's own DifferentiablePrior.
+    forward() (`hyperparameters = {**self.h, **sampled_hyperparameters_passed}`).
+    Values coming out for the meta_gamma/meta_trunc_norm_log_scaled/
+    meta_beta entries are one-call thunks by construction -- do NOT resolve
+    them here; FlexibleCategorical.__init__'s own existing
+    `hyperparameters[k]() if callable(...)` line does that, exactly as it
+    does for official's real training.
+
+    Static values below (num_classes, categorical_feature_p=0.2, is_causal,
+    the nan_prob_*/set_value_to_nan/normalize_ignore_label_too/mix_activations
+    block) are cross-checked against the ACTUAL released checkpoint's saved
+    config (torch.load(...)[2]) wherever recoverable -- categorical_feature_p
+    IS a fixed 0.2 there (not a {0,0.1,0.2} table-level draw, which was this
+    repo's earlier, wrong assumption), normalize_ignore_label_too=True,
+    set_value_to_nan=0.1, mix_activations=True (activation choice varies per
+    LAYER within a table, not fixed per table -- DIFF_CAUSAL_CONFIG's
+    prior_mlp_activations sampling already produces the right nested-callable
+    shape for this; mix_activations=True here just stops mlp.py's own code
+    from collapsing it to one fixed activation). num_classes remains our own
+    approximation (rng.integers(2,11)) -- the checkpoint's real sampler is a
+    lambda pickled as an unrecoverable string repr, confirmed genuinely
+    dynamic (not hardcoded) but not recoverable exactly. is_causal stays
+    pinned True -- the checkpoint's config confirms it really was
+    differentiable/mixed with noncausal tables, so this is a known,
+    deliberate exclusion (the "no BNN" decision), not an accidental match."""
     _install_instrumented_forward(flexible_categorical)
 
     num_classes = int(rng.integers(2, 11))
-    num_layers = int(rng.integers(2, 9))
-    prior_mlp_hidden_dim = int(rng.integers(64, 200))
-    num_causes = int(rng.integers(1, min(10, num_features) + 1))
-    noise_std = float(rng.uniform(0.05, 0.3))
-    dropout_prob = float(rng.uniform(0.0, 0.3))
-    categorical_feature_p = float(rng.choice(categorical_feature_p_choices))
     seq_len = n_context + n_query
 
+    sampled_hp, _ = diff_hparams.sample_parameter_object()
+
     hp = dict(
-        num_classes=num_classes, balanced=False, multiclass_type="rank", output_multiclass_ordered_p=0.5,
+        num_classes=num_classes, balanced=False,
         nan_prob_no_reason=0.0, nan_prob_a_reason=0.0, nan_prob_unknown_reason=0.0,
-        nan_prob_unknown_reason_reason_prior=0.5, set_value_to_nan=0.5,
+        nan_prob_unknown_reason_reason_prior=1.0, set_value_to_nan=0.1,
         categorical_feature_p=categorical_feature_p,
         normalize_to_ranking=False, normalize_by_used_features=True, num_features_used=num_features,
-        check_is_compatible=True, normalize_labels=True, normalize_ignore_label_too=False,
+        normalize_ignore_label_too=True,
         rotate_normalized_labels=True, seq_len_used=seq_len,
-        num_layers=num_layers, is_causal=True, num_causes=num_causes, prior_mlp_hidden_dim=prior_mlp_hidden_dim,
-        pre_sample_causes=True, noise_std=noise_std, pre_sample_weights=True,
-        prior_mlp_activations=lambda: (lambda: torch.nn.Tanh()),
-        block_wise_dropout=False, prior_mlp_dropout_prob=dropout_prob, prior_mlp_scale_weights_sqrt=True,
-        init_std=1.0, new_mlp_per_example=True, mix_activations=False, sampling="normal",
-        y_is_effect=True, in_clique=False, sort_features=False, random_feature_rotation=True, verbose=False,
+        is_causal=True,
+        prior_mlp_scale_weights_sqrt=True, normalize_with_sqrt=False,
+        new_mlp_per_example=True, mix_activations=True,
+        random_feature_rotation=True, verbose=False,
+        output_multiclass_ordered_p=0.0,
+        # check_is_compatible / normalize_labels: absent from the checkpoint's
+        # own saved config entirely (confirmed by the same mechanical diff --
+        # this pip package's flexible_categorical.py requires both via plain
+        # `self.h[...]` access, so there's no way to run this code at all
+        # without supplying them; they're newer than this 2022 checkpoint,
+        # so there's no historical value to match against). True is the only
+        # sensible choice -- False would either skip a real safety check
+        # (context/query share the same label set) or skip the label
+        # densification/rotation step that's clearly active per
+        # rotate_normalized_labels/normalize_ignore_label_too being real,
+        # checkpoint-confirmed settings.
+        check_is_compatible=True, normalize_labels=True,
     )
+    hp.update(sampled_hp)
 
     _CAPTURED.clear()
     x, y, _ = flexible_categorical.get_batch(
@@ -275,7 +394,8 @@ class OfficialV1LiveTableGenerator:
     def __init__(self, n_rows: int, n_cols: int, base_seed: int, n_query_for_check: int = 64):
         self.cfg = _OfficialV1Cfg(n_rows, n_cols, base_seed, n_query_for_check)
         self.rng = np.random.default_rng(base_seed)
-        self.mlp, self.flexible_categorical = bypass_import_priors()
+        self.mlp, self.flexible_categorical, differentiable_prior = bypass_import_priors()
+        self.diff_hparams = build_differentiable_hparams(differentiable_prior)
 
     def sample_table(self) -> FullSyntheticTable:
         num_features = self.cfg.n_cols - 1
@@ -284,7 +404,7 @@ class OfficialV1LiveTableGenerator:
         n_query = n_rows - n_context
 
         x_np, y_np, num_classes, _cat_info = generate_official_v1_table(
-            self.mlp, self.flexible_categorical, self.rng,
+            self.mlp, self.flexible_categorical, self.diff_hparams, self.rng,
             num_features=num_features, n_context=n_context, n_query=n_query,
         )
 
