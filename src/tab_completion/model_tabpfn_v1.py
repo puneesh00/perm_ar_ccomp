@@ -112,13 +112,13 @@ class TabPFNV1Layer(nn.Module):
         B, N, C, d = src.shape
 
         x = src.reshape(B * N, C, d)
-        x = self.feature_attn(x, x, x)[0] + x
+        x = self.feature_attn(x, x, x, need_weights=False)[0] + x
         src = self.norm1(x.reshape(B, N, C, d))
 
         x = src.transpose(1, 2).reshape(B * C, N, d)
         ctx = x[:, :n_context]
-        left = self.datapoint_attn(ctx, ctx, ctx)[0]
-        right = self.datapoint_attn(x[:, n_context:], ctx, ctx)[0]
+        left = self.datapoint_attn(ctx, ctx, ctx, need_weights=False)[0]
+        right = self.datapoint_attn(x[:, n_context:], ctx, ctx, need_weights=False)[0]
         x = torch.cat([left, right], dim=1) + x
         src = self.norm2(x.reshape(B, C, N, d).transpose(1, 2))
 
